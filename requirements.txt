@@ -1,0 +1,6 @@
+shiny
+pandas
+numpy
+matplotlib
+requests
+kagglehub
