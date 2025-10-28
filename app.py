@@ -1,14 +1,11 @@
 # app.py
 # 🎬 Web-Intelligence: IMDb × Rotten Tomatoes (Kagglehub) — Shiny for Python
-# Interaktive Auswertung + Visualisierungen + CSV-Download
-# ----------------------------------------------------------
-# Anforderungen:
-#   pip install shiny pandas numpy matplotlib requests kagglehub
-# Optional: Setze die Umgebungsvariable RT_DATASET_FILE auf eine andere Datei im Kaggle-Dataset
-# ----------------------------------------------------------
+# Kompatibel mit Shiny ≤ 1.5.0 (Posit Connect Cloud)
+# Tabs: Überblick | IMDb↔RT | Genres & Jahrzehnte | Google Trends | Downloads | Tabelle
+# ------------------------------------------------------------------------------------
 
 from __future__ import annotations
-import io, gzip, re, os, json, datetime, textwrap
+import io, gzip, re, os, json, datetime, time, random
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -32,8 +29,7 @@ def norm_title(t: str) -> str:
 
 def read_imdb_tsv(name: str, usecols=None) -> pd.DataFrame:
     url = f"{IMDB_BASE}/{name}"
-    r = requests.get(url, timeout=180)
-    r.raise_for_status()
+    r = requests.get(url, timeout=180); r.raise_for_status()
     return pd.read_csv(
         io.BytesIO(gzip.decompress(r.content)),
         sep="\t", na_values="\\N", usecols=usecols, low_memory=False
@@ -96,7 +92,6 @@ def std_rt_kaggle(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def load_rt_via_kagglehub(dataset_id=RT_DATASET_ID, file_path=RT_FILE_DEFAULT) -> pd.DataFrame:
-    # Lazy import, damit App ohne kagglehub starten kann (bei rein manueller Datei)
     try:
         import kagglehub
         from kagglehub import KaggleDatasetAdapter
@@ -114,7 +109,6 @@ def load_rt_via_kagglehub(dataset_id=RT_DATASET_ID, file_path=RT_FILE_DEFAULT) -
         raise RuntimeError(f"Kagglehub-Download fehlgeschlagen: {e}")
 
 def load_data(initial_rt: pd.DataFrame | None = None):
-    # IMDb
     basics  = read_imdb_tsv("title.basics.tsv.gz",  ["tconst","titleType","primaryTitle","startYear","runtimeMinutes","genres"])
     ratings = read_imdb_tsv("title.ratings.tsv.gz", ["tconst","averageRating","numVotes"])
     movies  = basics[basics["titleType"]=="movie"].copy()
@@ -124,27 +118,43 @@ def load_data(initial_rt: pd.DataFrame | None = None):
     movies["title_norm"]     = movies["title"].map(norm_title)
     imdb_full = movies.merge(ratings, on="tconst", how="left")
 
-    # RT
     if initial_rt is None:
         try:
             rt_raw = load_rt_via_kagglehub()
         except Exception as e:
-            rt_raw = pd.DataFrame()  # Fallback: UI erlaubt Upload
+            rt_raw = pd.DataFrame()
             print("Hinweis:", e)
     else:
         rt_raw = initial_rt
 
     rt_std = std_rt_kaggle(rt_raw) if not rt_raw.empty else pd.DataFrame(columns=["title_norm","year","rt_tomato","rt_audience"])
 
-    # Join (IMDb als Basis)
     imdb_sel = imdb_full[["tconst","title","title_norm","year","averageRating","numVotes","genres"]].copy()
     joined   = imdb_sel.merge(rt_std, on=["title_norm","year"], how="left")
     return imdb_full, rt_std, joined
 
-# ---------- Shiny UI ----------
+# ---------- UI (Dark Mode + Branding) ----------
 
 app_ui = ui.page_fluid(
+    # Dark mode styles
+    ui.tags.style("""
+        body { background-color: #1e1e1e; color: #eaeaea; }
+        .card, .value-box, .form-control, .navbar, .nav-tabs {
+            background-color: #2c2c2c !important; color: #eaeaea !important; border-color: #444 !important;
+        }
+        .btn, .download-btn { background-color: #0a84ff !important; color: white !important; border-radius: 8px; }
+        h1, h2, h3, h4 { color: #f5f5f5; }
+        a { color: #66aaff; }
+    """),
+
     ui.panel_title("🎬 Web-Intelligence: IMDb × Rotten Tomatoes (Kagglehub)"),
+
+    ui.tags.div(
+        ui.tags.img(src="https://upload.wikimedia.org/wikipedia/commons/6/6e/Film_Reel_Icon.png", height="60px"),
+        ui.tags.h2("Movie Analytics Dashboard", style="display:inline; margin-left:15px; color:#fff;"),
+        class_="d-flex align-items-center mb-3"
+    ),
+
     ui.row(
         ui.column(4,
             ui.card(
@@ -156,14 +166,10 @@ app_ui = ui.page_fluid(
                 ui.input_file("rt_upload", "Oder: Rotten-Tomatoes CSV manuell hochladen", accept=[".csv"], multiple=False),
                 ui.tags.small("Tipp: Wenn Kagglehub blockiert ist, kannst du hier eine CSV aus dem Kaggle-Dataset hochladen.")
             ),
-            ui.card(
-                ui.card_header("Downloads"),
-                ui.download_button("dl_joined", "Ergebnistabelle (CSV) herunterladen")
-            ),
         ),
         ui.column(8,
             ui.navset_tab(
-                ui.nav(
+                ui.nav_panel(
                     "Überblick",
                     ui.layout_column_wrap(
                         ui.value_box("n_movies", "Filme (gefiltert)"),
@@ -173,17 +179,43 @@ app_ui = ui.page_fluid(
                     ),
                     ui.output_plot("plot_avg_by_source", height="350px"),
                 ),
-                ui.nav(
+                ui.nav_panel(
                     "IMDb ↔ Rotten Tomatoes",
                     ui.output_plot("plot_scatter", height="380px"),
                     ui.output_plot("plot_dist", height="380px"),
                 ),
-                ui.nav(
+                ui.nav_panel(
                     "Genres & Jahrzehnte",
                     ui.output_plot("plot_genre", height="380px"),
                     ui.output_plot("plot_decade", height="380px"),
                 ),
-                ui.nav(
+                ui.nav_panel(
+                    "Google Trends",
+                    ui.card(
+                        ui.card_header("Abruf"),
+                        ui.input_text("gt_kw1", "Keyword 1", "The Dark Knight 2008"),
+                        ui.input_text("gt_kw2", "Keyword 2", "Inception 2010"),
+                        ui.input_text("gt_kw3", "Keyword 3", "Oppenheimer 2023"),
+                        ui.input_text("gt_kw4", "Keyword 4", "Fight Club 1999"),
+                        ui.input_text("gt_kw5", "Keyword 5", "Forrest Gump 1994"),
+                        ui.input_radio_buttons("gt_range", "Zeitraum", choices=["today 5-y","today 12-m","today 3-m"], selected="today 5-y", inline=True),
+                        ui.input_action_button("gt_fetch", "Trends abrufen"),
+                        ui.tags.small("Hinweis: In Uni-Netzen/Clouds kann Google Trends blockieren. Die App versucht mehrfach (Backoff) und nutzt notfalls Keywords ohne Jahr.")
+                    ),
+                    ui.output_text("gt_status"),
+                    ui.output_plot("gt_plot", height="380px"),
+                    ui.download_button("dl_trends", "Google-Trends (CSV)")
+                ),
+                ui.nav_panel(
+                    "Downloads",
+                    ui.card(
+                        ui.card_header("CSV-Exporte"),
+                        ui.download_button("dl_joined", "Ergebnistabelle (IMDb × RT)"),
+                        ui.download_button("dl_top20", "Top-20 nach Stimmen (IMDb)"),
+                        ui.tags.small("Tipp: Falls Google Trends nicht geht, exportiere direkt auf trends.google.com und nutze die CSV in deiner Doku.")
+                    )
+                ),
+                ui.nav_panel(
                     "Tabelle",
                     ui.output_data_frame("table_movies")
                 )
@@ -193,16 +225,16 @@ app_ui = ui.page_fluid(
     ui.tags.hr(),
     ui.tags.small(
         "Daten: IMDb (offizielle TSVs) & Rotten Tomatoes (Kagglehub). ",
-        "Bei RT-Problemen CSV hochladen. ",
+        "Google Trends mit robustem Retry/Fallback. ",
         f"Build: {datetime.datetime.now(datetime.timezone.utc).isoformat()}Z"
     )
 )
 
-# ---------- Shiny Server ----------
+# ---------- Server ----------
 
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Reactive: globaler Datensatz (mit optionalem manuellem Upload)
+    # Manuell hochgeladene RT-CSV
     rt_manual = reactive.Value(pd.DataFrame())
 
     @reactive.effect
@@ -214,8 +246,9 @@ def server(input: Inputs, output: Outputs, session: Session):
         try:
             df = pd.read_csv(f[0]["datapath"])
             rt_manual.set(df)
+            ui.notification_show("RT-CSV geladen. Daten werden neu aufgebaut.", duration=4, type="message")
         except Exception as e:
-            print("Upload-Fehler:", e)
+            ui.notification_show(f"Upload-Fehler: {e}", duration=6, type="warning")
 
     @reactive.Calc
     def data_all():
@@ -226,7 +259,6 @@ def server(input: Inputs, output: Outputs, session: Session):
             imdb, rt, joined = load_data()
         return imdb, rt, joined
 
-    # Gefilterte Sicht
     @reactive.Calc
     def data_filtered():
         imdb, rt, joined = data_all()
@@ -237,7 +269,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         df = df[df["numVotes"].fillna(0) >= mv]
         return df
 
-    # KPIs
     @output
     @render.value_box
     def n_movies():
@@ -260,11 +291,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         txt = f"{val:.1f}" if pd.notna(val) else "—"
         return ui.value_box(showcase=None, title="Ø RT Tomatometer", value=txt)
 
-    # Plots
-    def _plt_to_obj(fig):
-        # Shiny zeigt matplotlib-Fig direkt; Helper falls nötig
-        return fig
-
     @output
     @render.plot
     def plot_avg_by_source():
@@ -283,13 +309,12 @@ def server(input: Inputs, output: Outputs, session: Session):
             fig, ax = plt.subplots(figsize=(6,3))
             ax.text(0.5,0.5,"Keine Daten für Balkendiagramm", ha="center", va="center")
             ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         fig, ax = plt.subplots(figsize=(8,4))
         ax.bar(list(vals.keys()), list(vals.values()))
         ax.set_title("Durchschnittliche Bewertung nach Quelle (0–100)")
-        ax.set_ylabel("Score")
-        ax.set_ylim(0,100)
-        return _plt_to_obj(fig)
+        ax.set_ylabel("Score"); ax.set_ylim(0,100)
+        return fig
 
     @output
     @render.plot
@@ -298,24 +323,23 @@ def server(input: Inputs, output: Outputs, session: Session):
         if "rt_tomato" not in df.columns:
             fig, ax = plt.subplots(figsize=(4,3))
             ax.text(0.5,0.5,"Kein RT verfügbar", ha="center", va="center"); ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         tmp = df.dropna(subset=["averageRating","rt_tomato"]).copy()
         if tmp.empty:
             fig, ax = plt.subplots(figsize=(4,3))
             ax.text(0.5,0.5,"Keine Schnittmenge IMDb × RT", ha="center", va="center"); ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         fig, ax = plt.subplots(figsize=(6,6))
         ax.scatter(tmp["averageRating"]*10, tmp["rt_tomato"], alpha=0.5)
         ax.set_xlabel("IMDb (x10)"); ax.set_ylabel("RT Tomatometer (%)")
         ax.set_title("IMDb vs Rotten Tomatoes")
-        # einfache Trendlinie
         x = (tmp["averageRating"]*10).values; y = tmp["rt_tomato"].values
         if len(x) >= 2:
             m, b = np.polyfit(x, y, 1)
             xs = np.linspace(x.min(), x.max(), 100); ys = m*xs + b
             ax.plot(xs, ys)
         ax.set_xlim(0,100); ax.set_ylim(0,100)
-        return _plt_to_obj(fig)
+        return fig
 
     @output
     @render.plot
@@ -324,12 +348,12 @@ def server(input: Inputs, output: Outputs, session: Session):
         if "rt_tomato" not in df.columns:
             fig, ax = plt.subplots(figsize=(4,3))
             ax.text(0.5,0.5,"Kein RT verfügbar", ha="center", va="center"); ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         tmp = df.dropna(subset=["averageRating","rt_tomato"]).copy()
         if tmp.empty:
             fig, ax = plt.subplots(figsize=(4,3))
             ax.text(0.5,0.5,"Keine Daten für Verteilung", ha="center", va="center"); ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         fig, ax = plt.subplots(figsize=(9,4))
         ax.hist(tmp["averageRating"]*10, bins=30, alpha=0.5, density=True, label="IMDb")
         ax.hist(tmp["rt_tomato"], bins=30, alpha=0.5, density=True, label="RT Tomatometer")
@@ -337,9 +361,8 @@ def server(input: Inputs, output: Outputs, session: Session):
             if tmp["rt_audience"].notna().any():
                 ax.hist(tmp["rt_audience"], bins=30, alpha=0.3, density=True, label="RT Audience")
         ax.set_title("Bewertungsverteilung")
-        ax.set_xlabel("Score (0–100)"); ax.legend()
-        ax.set_xlim(0,100)
-        return _plt_to_obj(fig)
+        ax.set_xlabel("Score (0–100)"); ax.legend(); ax.set_xlim(0,100)
+        return fig
 
     @output
     @render.plot
@@ -349,7 +372,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if imdb_g.empty:
             fig, ax = plt.subplots(figsize=(4,3))
             ax.text(0.5,0.5,"Keine Genre-Daten", ha="center", va="center"); ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         g = imdb_g.assign(genre=imdb_g["genres"].str.split(",")).explode("genre")
         avg_by_genre = (g.groupby("genre")["averageRating"].mean().sort_values(ascending=False).head(12))*10
         fig, ax = plt.subplots(figsize=(9,4))
@@ -357,7 +380,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("IMDb (≥50k Stimmen): Ø Bewertung pro Genre (Top 12)")
         ax.set_xticklabels(avg_by_genre.index.tolist(), rotation=45, ha="right")
         ax.set_ylabel("Ø Bewertung (0–100)"); ax.set_ylim(0,100)
-        return _plt_to_obj(fig)
+        return fig
 
     @output
     @render.plot
@@ -367,7 +390,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if dec.empty:
             fig, ax = plt.subplots(figsize=(4,3))
             ax.text(0.5,0.5,"Keine Jahresdaten", ha="center", va="center"); ax.axis("off")
-            return _plt_to_obj(fig)
+            return fig
         dec["year"] = dec["year"].astype(int)
         dec["decade"] = (dec["year"]//10)*10
         dec_avg = (dec.groupby("decade")["averageRating"].mean().sort_index())*10
@@ -376,7 +399,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("IMDb: Ø Bewertung nach Jahrzehnt")
         ax.set_xlabel("Jahrzehnt"); ax.set_ylabel("Ø Bewertung (0–100)")
         ax.set_ylim(0,100)
-        return _plt_to_obj(fig)
+        return fig
 
     @output
     @render.data_frame
@@ -387,26 +410,116 @@ def server(input: Inputs, output: Outputs, session: Session):
             if c not in df.columns:
                 df[c] = pd.NA
         df = df[cols].sort_values(["numVotes"], ascending=False)
-        # kleine Skalenangleichung
         df["IMDb (x10)"] = (df["averageRating"]*10).round(1)
         df["RT Tomatometer"] = df["rt_tomato"].round(1)
         df["RT Audience"] = df["rt_audience"].round(1)
         df = df.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
         return df[["Titel","Jahr","IMDb (x10)","RT Tomatometer","RT Audience","Stimmen","genres","tconst"]]
 
+    # Downloads
     @output
     @render.download(filename=lambda: f"joined_movies_{datetime.date.today().isoformat()}.csv")
     def dl_joined():
         _, _, joined = data_all()
         yield joined.to_csv(index=False).encode("utf-8")
 
-    # Kagglehub-Reload
+    @output
+    @render.download(filename=lambda: f"top20_imdb_{datetime.date.today().isoformat()}.csv")
+    def dl_top20():
+        imdb, _, _ = data_all()
+        top20 = imdb.sort_values("numVotes", ascending=False).loc[:,["tconst","title","year","averageRating","numVotes"]].head(20)
+        yield top20.to_csv(index=False).encode("utf-8")
+
+    # Google Trends (robust mit Retry/Fallback)
+    gt_store_df = reactive.Value(pd.DataFrame())
+    gt_store_cols = reactive.Value([])
+    gt_status_txt = reactive.Value("Noch keine Abfrage gestartet.")
+
+    def _trends_try_fetch(keywords: list[str], timeframe: str, max_retries=4, wait_base=3.0):
+        try:
+            from pytrends.request import TrendReq
+        except Exception as e:
+            return None, f"Pytrends nicht installiert/verfügbar: {e}"
+
+        pytrends = TrendReq(hl="de-DE", tz=0)
+        for attempt in range(max_retries):
+            try:
+                pytrends.build_payload(kw_list=keywords, timeframe=timeframe)
+                d = pytrends.interest_over_time()
+                if d is not None and not d.empty:
+                    return d, "OK"
+            except Exception:
+                sleep_s = wait_base * (2**attempt) + random.uniform(0, 0.8)
+                time.sleep(sleep_s)
+        return None, f"Keine Daten (Rate-Limit/Block?). Versuche: {max_retries}."
+
+    def _keywords():
+        kws = [input.gt_kw1(), input.gt_kw2(), input.gt_kw3(), input.gt_kw4(), input.gt_kw5()]
+        return [k for k in kws if k and k.strip()][:5]
+
+    @reactive.effect
+    @reactive.event(input.gt_fetch)
+    def _gt_fetch():
+        gt_status_txt.set("Hole Trends …")
+        timeframe = input.gt_range()
+        kws = _keywords()
+        if not kws:
+            gt_status_txt.set("Bitte mindestens ein Keyword eingeben.")
+            gt_store_df.set(pd.DataFrame()); gt_store_cols.set([])
+            return
+
+        d, msg = _trends_try_fetch(kws, timeframe)
+        if d is None or d.empty:
+            # Fallback: Keywords ohne Jahr
+            kws_fallback = [re.sub(r"\b(19|20)\d{2}\b","", k).strip() for k in kws]
+            kws_fallback = [re.sub(r"\s+"," ", k) for k in kws_fallback]
+            d, msg2 = _trends_try_fetch(kws_fallback, timeframe)
+            if d is None or d.empty:
+                gt_status_txt.set(f"Trends fehlgeschlagen. Hinweis: {msg2}")
+                gt_store_df.set(pd.DataFrame()); gt_store_cols.set([])
+                return
+            else:
+                gt_status_txt.set("Trends OK (Fallback ohne Jahr).")
+                gt_store_df.set(d.reset_index()); gt_store_cols.set(kws_fallback)
+        else:
+            gt_status_txt.set("Trends OK.")
+            gt_store_df.set(d.reset_index()); gt_store_cols.set(kws)
+
+    @output
+    @render.text
+    def gt_status():
+        return gt_status_txt.get()
+
+    @output
+    @render.plot
+    def gt_plot():
+        d = gt_store_df.get()
+        if d is None or d.empty:
+            fig, ax = plt.subplots(figsize=(6,3))
+            ax.text(0.5,0.5,"Noch keine Daten", ha="center", va="center"); ax.axis("off")
+            return fig
+        cols = gt_store_cols.get()
+        fig, ax = plt.subplots(figsize=(9,4))
+        d = d.set_index("date") if "date" in d.columns else d.set_index(d.columns[0])
+        for c in cols:
+            if c in d.columns:
+                ax.plot(d.index, d[c], label=c)
+        ax.set_title("Google Trends: Suchinteresse")
+        ax.set_xlabel("Datum"); ax.set_ylabel("Relatives Interesse (0–100)")
+        ax.legend()
+        return fig
+
     @reactive.effect
     @reactive.event(input.reload_kaggle)
     def _reload_rt():
-        # Reset manuelles Upload-DF -> nächste data_all lädt wieder via kagglehub
         rt_manual.set(pd.DataFrame())
         ui.notification_show("Kagglehub-Download wird beim nächsten Zugriff neu ausgeführt.", duration=4, type="message")
+
+    @output
+    @render.download(filename=lambda: f"google_trends_{datetime.date.today().isoformat()}.csv")
+    def dl_trends():
+        d = gt_store_df.get()
+        yield (d if d is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8")
 
 
 app = App(app_ui, server)
