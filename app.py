@@ -78,10 +78,10 @@ def std_rt_kaggle(df: pd.DataFrame) -> pd.DataFrame:
     if c_aud:    ren[c_aud]    = "rt_audience_raw"
     d.rename(columns=ren, inplace=True)
 
-    d["title_norm"] = d["title"].map(norm_title) if "title" in d else ""
+    d["title_norm"] = d["title"].map(norm_title) if "title" in d.columns else ""
 
     year = pd.to_numeric(d.get("year_raw", pd.Series(index=d.index)), errors="coerce")
-    if year.isna().all() and "movie_info_raw" in d:
+    if year.isna().all() and "movie_info_raw" in d.columns:
         year = d["movie_info_raw"].map(parse_year_from_text)
     d["year"] = year
 
@@ -172,9 +172,9 @@ app_ui = ui.page_fluid(
                 ui.nav_panel(
                     "Überblick",
                     ui.layout_column_wrap(
-                        ui.value_box("n_movies", "Filme (gefiltert)"),
-                        ui.value_box("avg_imdb", "Ø IMDb (x10)"),
-                        ui.value_box("avg_rt", "Ø RT Tomatometer"),
+                        ui.output_ui("n_movies"),
+                        ui.output_ui("avg_imdb"),
+                        ui.output_ui("avg_rt"),
                         fill=False
                     ),
                     ui.output_plot("plot_avg_by_source", height="350px"),
@@ -200,7 +200,7 @@ app_ui = ui.page_fluid(
                         ui.input_text("gt_kw5", "Keyword 5", "Forrest Gump 1994"),
                         ui.input_radio_buttons("gt_range", "Zeitraum", choices=["today 5-y","today 12-m","today 3-m"], selected="today 5-y", inline=True),
                         ui.input_action_button("gt_fetch", "Trends abrufen"),
-                        ui.tags.small("Hinweis: In Uni-Netzen/Clouds kann Google Trends blockieren. Die App versucht mehrfach (Backoff) und nutzt notfalls Keywords ohne Jahr.")
+                        ui.tags.small("Hinweis: In Uni/Cloud-Netzen kann Google Trends blockieren. Die App versucht mehrfach (Backoff) und nutzt notfalls Keywords ohne Jahr.")
                     ),
                     ui.output_text("gt_status"),
                     ui.output_plot("gt_plot", height="380px"),
@@ -269,40 +269,41 @@ def server(input: Inputs, output: Outputs, session: Session):
         df = df[df["numVotes"].fillna(0) >= mv]
         return df
 
+    # --- KPIs (Shiny ≥1.5: via render.ui + ui.value_box) ---
     @output
-    @render.value_box
+    @render.ui
     def n_movies():
         df = data_filtered()
-        return ui.value_box(showcase=None, title="Filme (gefiltert)", value=f"{len(df):,}")
+        return ui.value_box(title="Filme (gefiltert)", value=f"{len(df):,}")
 
     @output
-    @render.value_box
+    @render.ui
     def avg_imdb():
         df = data_filtered()
-        val = (df["averageRating"].dropna().mean()*10) if not df["averageRating"].dropna().empty else np.nan
+        val = (df["averageRating"].dropna().mean()*10) if "averageRating" in df.columns and not df["averageRating"].dropna().empty else np.nan
         txt = f"{val:.1f}" if pd.notna(val) else "—"
-        return ui.value_box(showcase=None, title="Ø IMDb (x10)", value=txt)
+        return ui.value_box(title="Ø IMDb (x10)", value=txt)
 
     @output
-    @render.value_box
+    @render.ui
     def avg_rt():
         df = data_filtered()
-        val = df["rt_tomato"].dropna().mean() if "rt_tomato" in df.columns else np.nan
+        val = df["rt_tomato"].dropna().mean() if "rt_tomato" in df.columns and not df["rt_tomato"].dropna().empty else np.nan
         txt = f"{val:.1f}" if pd.notna(val) else "—"
-        return ui.value_box(showcase=None, title="Ø RT Tomatometer", value=txt)
+        return ui.value_box(title="Ø RT Tomatometer", value=txt)
 
     @output
     @render.plot
     def plot_avg_by_source():
         df = data_filtered()
         vals = {}
-        if "averageRating" in df:
+        if "averageRating" in df.columns:
             v = df["averageRating"].dropna()
             if not v.empty: vals["IMDb (x10)"] = v.mean()*10
-        if "rt_tomato" in df:
+        if "rt_tomato" in df.columns:
             r = df["rt_tomato"].dropna()
             if not r.empty: vals["RT Tomatometer"] = r.mean()
-        if input.use_audience() and "rt_audience" in df:
+        if input.use_audience() and "rt_audience" in df.columns:
             a = df["rt_audience"].dropna()
             if not a.empty: vals["RT Audience"] = a.mean()
         if not vals:
@@ -357,7 +358,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig, ax = plt.subplots(figsize=(9,4))
         ax.hist(tmp["averageRating"]*10, bins=30, alpha=0.5, density=True, label="IMDb")
         ax.hist(tmp["rt_tomato"], bins=30, alpha=0.5, density=True, label="RT Tomatometer")
-        if input.use_audience() and "rt_audience" in tmp:
+        if input.use_audience() and "rt_audience" in tmp.columns:
             if tmp["rt_audience"].notna().any():
                 ax.hist(tmp["rt_audience"], bins=30, alpha=0.3, density=True, label="RT Audience")
         ax.set_title("Bewertungsverteilung")
