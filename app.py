@@ -113,7 +113,7 @@ def build_joined(rt_raw: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.D
 
 # -------------------- UI (hell + Sidebar) --------------------
 app_ui = ui.page_sidebar(
-    sidebar=ui.sidebar(
+    ui.sidebar(
         ui.tags.style("""
             body{background:#f7f8fb;color:#1a1a1a;}
             .sidebar{background:#ffffff;border-right:1px solid #e8ebf3;}
