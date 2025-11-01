@@ -1,21 +1,43 @@
-# app.py — Movie Ratings (IMDb × RT via Kagglehub) — shiny 1.5.0 kompatibel
+# app.py — Movie Ratings (IMDb × RT via Kagglehub) — preload + cache + hübsche Sidebar
 from __future__ import annotations
-import io, gzip, re, os, time, random, threading, datetime
+import io, gzip, re, os, time, random, threading, datetime, traceback
 import numpy as np, pandas as pd, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# -------- Config --------
+# ---------------- Config ----------------
 IMDB_BASE = "https://datasets.imdbws.com"
 RT_DATASET_ID = "stefanoleone992/rotten-tomatoes-movies-and-critic-reviews-dataset"
 RT_FILE_DEFAULT = os.getenv("RT_DATASET_FILE", "rotten_tomatoes_movies.csv")
-REQUEST_TIMEOUT = 45
-SAMPLE_MAX      = 80000
-KEEPALIVE_SECS  = 20
 
-# -------- Helpers --------
+REQUEST_TIMEOUT = 45          # sec / HTTP
+SAMPLE_MAX      = 80000       # weiches Limit für erste Anzeige
+KEEPALIVE_SECS  = 20          # keep alive gegen idle-kick
+
+DATA_DIR        = os.getenv("DATA_DIR", "data")  # Cache-Ordner
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ---------------- Helpers ----------------
+def _cache_path(name: str) -> str:
+    return os.path.join(DATA_DIR, name)
+
+def save_csv(df: pd.DataFrame, name: str) -> None:
+    try:
+        df.to_csv(_cache_path(name), index=False)
+    except Exception:
+        pass
+
+def try_read_csv(name: str) -> pd.DataFrame | None:
+    p = _cache_path(name)
+    if os.path.exists(p):
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            return None
+    return None
+
 def norm_title(t: str) -> str:
     if pd.isna(t): return ""
     t = re.sub(r"[^a-z0-9 ]+"," ", str(t).lower())
@@ -91,31 +113,41 @@ def build_joined(rt_raw: pd.DataFrame|None=None):
         joined = joined.sample(SAMPLE_MAX, random_state=42)
     return imdb, rt_std, joined
 
-# -------- UI (helle Sidebar, ohne JS) --------
+# ---------------- UI (helle Sidebar, modernes Styling) ----------------
 app_ui = ui.page_sidebar(
-    # 1) Sidebar (positionsargument)
+    # Sidebar (positionsargument)
     ui.sidebar(
         ui.tags.style("""
-        body{background:#f7f8fb;color:#1a1a1a}
-        .sidebar{background:#fff;border-right:1px solid #e8ebf3}
-        .card{background:#fff;border:1px solid #e8ebf3;border-radius:14px;box-shadow:0 8px 18px rgba(16,24,40,.06)}
-        .btn{background:#2563eb;color:#fff;border-radius:10px;border:none}
-        h1{margin:0 0 8px 0;font-weight:700;color:#0f172a}
-        .muted{color:#6b7280;font-size:12px}
+        :root{--bg:#f7f8fb;--card:#ffffff;--muted:#6b7280;--line:#e8ebf3;--brand:#2563eb;--brand-weak:#e8efff}
+        body{background:var(--bg);color:#0f172a}
+        .sidebar{background:var(--card);border-right:1px solid var(--line)}
+        .card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 18px rgba(16,24,40,.06)}
+        .btn{background:var(--brand);color:#fff;border-radius:10px;border:none}
+        .muted{color:var(--muted);font-size:12px}
+        .side-nav .shiny-input-radiogroup>div>label{display:block;padding:9px 12px;margin:4px 0;border-radius:10px;border:1px solid var(--line);cursor:pointer}
+        .side-nav input[type="radio"]{display:none}
+        .side-nav .shiny-input-radiogroup>div>label:hover{background:#fafcff}
+        .side-nav .shiny-input-radiogroup>div>input:checked+label{background:var(--brand-weak);border-color:#c7d7ff}
         """),
         ui.tags.h2("Movie Ratings", style="margin:6px 0 18px 0;"),
-        ui.input_radio_buttons(
-            "page", "Navigation",
-            choices={
-                "overview":"Überblick",
-                "compare":"IMDb ↔ RT",
-                "trends":"Genres/Jahrzehnte",
-                "gtrends":"Google Trends",
-                "downloads":"Downloads",
-                "table":"Tabelle",
-            },
-            selected="overview",
-            inline=False
+        ui.div(
+            ui.tags.div("Navigation", class_="muted", style="margin-bottom:6px;"),
+            ui.div(
+                ui.input_radio_buttons(
+                    "page", None,
+                    choices={
+                        "overview":"Überblick",
+                        "compare":"IMDb ↔ RT",
+                        "trends":"Genres/Jahrzehnte",
+                        "gtrends":"Google Trends",
+                        "downloads":"Downloads",
+                        "table":"Tabelle",
+                    },
+                    selected="overview",
+                    inline=False
+                ),
+                class_="side-nav"
+            ),
         ),
         ui.tags.hr(),
         ui.tags.div("Filter", class_="muted", style="margin-bottom:6px;"),
@@ -128,7 +160,7 @@ app_ui = ui.page_sidebar(
         open={"desktop": "open", "mobile": "closed"},
     ),
 
-    # 2) Hauptinhalt (positionsargument)
+    # Hauptinhalt (positionsargument)
     ui.layout_column_wrap(
         ui.card(
             ui.card_header(ui.tags.div(id="page_title")),
@@ -137,26 +169,50 @@ app_ui = ui.page_sidebar(
         fill=False,
     ),
 
-    # 3) Keyword-Args
     title="Movie Ratings",
 )
 
-# -------- Server --------
+# ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Keep-Alive
+    # Keep alive
     @reactive.effect
     def _keepalive():
         reactive.invalidate_later(KEEPALIVE_SECS)
 
-    # Daten-Cache
+    # Store + Status
     store = reactive.Value({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
 
-    def bg_load(rt_override: pd.DataFrame|None=None):
+    def set_error(prefix: str, e: Exception):
+        msg = f"{prefix}: {e.__class__.__name__}: {e}"
+        store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":msg})
+        ui.notification_show(msg, type="warning", duration=8)
+
+    # Start: Versuche Cache zu lesen, sonst Background-Build
+    def warm_start():
+        try:
+            imdb  = try_read_csv("imdb.csv")
+            rt    = try_read_csv("rt_std.csv")
+            joined= try_read_csv("joined.csv")
+            if imdb is not None and rt is not None and joined is not None and not joined.empty:
+                store.set({"ready":True,"imdb":imdb,"rt":rt,"joined":joined,"error":""})
+                return
+        except Exception:
+            pass
+        # Kein Cache: baue im Hintergrund
+        threading.Thread(target=bg_build_and_cache, daemon=True).start()
+
+    def bg_build_and_cache(rt_override: pd.DataFrame|None=None):
         try:
             imdb, rt, joined = build_joined(rt_override)
+            # Cache schreiben
+            save_csv(imdb,  "imdb.csv")
+            save_csv(rt,    "rt_std.csv")
+            save_csv(joined,"joined.csv")
             store.set({"ready":True,"imdb":imdb,"rt":rt,"joined":joined,"error":""})
+            ui.notification_show("Daten geladen.", type="message", duration=4)
         except Exception as e:
+            # Fallback-Demo
             demo = pd.DataFrame({
                 "title":["Demo A","Demo B","Demo C","Demo D"],
                 "title_norm":["demo a","demo b","demo c","demo d"],
@@ -168,12 +224,14 @@ def server(input: Inputs, output: Outputs, session: Session):
                 "rt_audience":[98,96,91,94],
                 "tconst":["tt0111161","tt0137523","tt1375666","tt0468569"],
             })
+            save_csv(demo, "joined.csv")
             store.set({"ready":True,"imdb":demo,"rt":demo[["title_norm","year","rt_tomato","rt_audience"]],
                        "joined":demo,"error":str(e)})
+            ui.notification_show("Konnte Live-Daten nicht laden – Demo-Daten werden angezeigt.", type="warning", duration=8)
 
-    threading.Thread(target=bg_load, daemon=True).start()
+    warm_start()  # kick-off beim Start
 
-    # Upload / Reload
+    # Upload / Reload (asynchron + Cache)
     @reactive.effect
     @reactive.event(input.rt_upload)
     def _on_upload():
@@ -181,18 +239,18 @@ def server(input: Inputs, output: Outputs, session: Session):
         if f:
             try:
                 df=pd.read_csv(f[0]["datapath"])
-                store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
-                threading.Thread(target=bg_load, args=(df,), daemon=True).start()
-                ui.notification_show("RT-CSV geladen – Daten werden aktualisiert …", type="message", duration=4)
             except Exception as e:
-                ui.notification_show(f"Upload-Fehler: {e}", type="warning", duration=6)
+                set_error("Upload-Fehler beim Einlesen", e); return
+            store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
+            ui.notification_show("RT-CSV geladen – baue Daten zusammen …", type="message", duration=4)
+            threading.Thread(target=bg_build_and_cache, args=(df,), daemon=True).start()
 
     @reactive.effect
     @reactive.event(input.reload_rt)
     def _reload():
         store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
-        threading.Thread(target=bg_load, daemon=True).start()
         ui.notification_show("Kagglehub wird neu geladen …", type="message", duration=4)
+        threading.Thread(target=bg_build_and_cache, daemon=True).start()
 
     # Filter
     @reactive.Calc
@@ -207,7 +265,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         df=df[df["numVotes"].fillna(0)>=mv]
         return df
 
-    # Titel pro Seite
+    # Titel
     @output
     @render.ui
     def page_title():
@@ -216,22 +274,29 @@ def server(input: Inputs, output: Outputs, session: Session):
            "downloads":"Downloads","table":"Tabelle"}
         return ui.tags.h3(t.get(input.page(),"Überblick"))
 
-    # Seiteninhalt (Loader solange Store nicht ready)
+    # Body
     @output
     @render.ui
     def page_body():
-        if not store.get()["ready"]:
+        s = store.get()
+        if not s["ready"]:
             return ui.div(
-                ui.tags.div("Lade Daten …", class_="muted", style="margin-bottom:8px;"),
-                ui.tags.progress(max="100", value="25"),  # <-- FIX: statt ui.progress
+                ui.tags.div("Lade Daten … (oder Cache wird erzeugt)", class_="muted", style="margin-bottom:8px;"),
+                ui.tags.progress(max="100", value="25"),
             )
+        if s["error"]:
+            # zeige Hinweis oberhalb des Inhalts
+            warn = ui.tags.div(f"Hinweis: {s['error']}", class_="muted", style="margin-bottom:10px;")
+        else:
+            warn = ui.tags.div()
+
         p=input.page()
-        if p=="overview":  return ui.div(kpi_ui(df_filtered()), ui.output_plot("p_avg"))
-        if p=="compare":   return ui.div(ui.output_plot("p_scatter"), ui.output_plot("p_dist"))
-        if p=="trends":    return ui.div(ui.output_plot("p_genre"), ui.output_plot("p_decade"))
-        if p=="gtrends":   return trends_ui()
-        if p=="downloads": return dl_ui()
-        if p=="table":     return ui.output_data_frame("tbl")
+        if p=="overview":  return ui.div(warn, kpi_ui(df_filtered()), ui.output_plot("p_avg"))
+        if p=="compare":   return ui.div(warn, ui.output_plot("p_scatter"), ui.output_plot("p_dist"))
+        if p=="trends":    return ui.div(warn, ui.output_plot("p_genre"), ui.output_plot("p_decade"))
+        if p=="gtrends":   return ui.div(warn, trends_ui())
+        if p=="downloads": return ui.div(warn, dl_ui())
+        if p=="table":     return ui.div(warn, ui.output_data_frame("tbl"))
         return ui.div("—")
 
     # KPIs
@@ -344,7 +409,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         top=imdb.sort_values("numVotes",ascending=False).loc[:,["tconst","title","year","averageRating","numVotes"]].head(20)
         yield top.to_csv(index=False).encode("utf-8")
 
-    # Google Trends (mit Retry/Fallback)
+    # Google Trends (mit Retry / Fallback)
     gt_df = reactive.Value(pd.DataFrame()); gt_cols = reactive.Value([]); gt_msg = reactive.Value("Noch keine Abfrage.")
 
     def _trends_try(kws, tf, retries=4, base=2.5):
