@@ -1,6 +1,6 @@
-# app.py — Movie Ratings (IMDb × RT via Kagglehub) — preload + cache + hübsche Sidebar
 from __future__ import annotations
-import io, gzip, re, os, time, random, threading, datetime, traceback
+import io, gzip, re, os, time, random, datetime
+import asyncio
 import numpy as np, pandas as pd, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -23,13 +23,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 def _cache_path(name: str) -> str:
     return os.path.join(DATA_DIR, name)
 
-def save_csv(df: pd.DataFrame, name: str) -> None:
+def save_csv_sync(df: pd.DataFrame, name: str) -> None:
     try:
         df.to_csv(_cache_path(name), index=False)
     except Exception:
         pass
 
-def try_read_csv(name: str) -> pd.DataFrame | None:
+def try_read_csv_sync(name: str) -> pd.DataFrame | None:
     p = _cache_path(name)
     if os.path.exists(p):
         try:
@@ -51,7 +51,8 @@ def to100(x):
         return v*10 if 0 <= v <= 10 else v
     except: return np.nan
 
-def read_imdb(name: str, usecols=None) -> pd.DataFrame:
+# --- Blocking helpers (werden via to_thread aufgerufen) ---
+def read_imdb_sync(name: str, usecols=None) -> pd.DataFrame:
     r = requests.get(f"{IMDB_BASE}/{name}", timeout=REQUEST_TIMEOUT); r.raise_for_status()
     return pd.read_csv(io.BytesIO(gzip.decompress(r.content)),
                        sep="\t", na_values="\\N", usecols=usecols, low_memory=False)
@@ -87,14 +88,15 @@ def std_rt(df: pd.DataFrame) -> pd.DataFrame:
     d["rt_audience"]=d.get("rt_audience_raw",pd.Series(index=d.index)).map(to100)
     return d[["title_norm","year","rt_tomato","rt_audience"]].dropna(subset=["title_norm"]).drop_duplicates()
 
-def load_rt_kagglehub(dataset_id=RT_DATASET_ID, file_path=RT_FILE_DEFAULT) -> pd.DataFrame:
+def load_rt_kagglehub_sync(dataset_id=RT_DATASET_ID, file_path=RT_FILE_DEFAULT) -> pd.DataFrame:
     import kagglehub
     from kagglehub import KaggleDatasetAdapter
     return kagglehub.load_dataset(KaggleDatasetAdapter.PANDAS, dataset_id, file_path)
 
-def build_joined(rt_raw: pd.DataFrame|None=None):
-    basics  = read_imdb("title.basics.tsv.gz",  ["tconst","titleType","primaryTitle","startYear","genres"])
-    ratings = read_imdb("title.ratings.tsv.gz", ["tconst","averageRating","numVotes"])
+# Blocking Build (im Thread ausführen)
+def build_joined_sync(rt_raw: pd.DataFrame|None=None):
+    basics  = read_imdb_sync("title.basics.tsv.gz",  ["tconst","titleType","primaryTitle","startYear","genres"])
+    ratings = read_imdb_sync("title.ratings.tsv.gz", ["tconst","averageRating","numVotes"])
     movies  = basics[basics["titleType"]=="movie"].copy()
     movies.rename(columns={"primaryTitle":"title","startYear":"year"},inplace=True)
     movies["year"]=pd.to_numeric(movies["year"],errors="coerce")
@@ -102,7 +104,7 @@ def build_joined(rt_raw: pd.DataFrame|None=None):
     imdb = movies.merge(ratings,on="tconst",how="left")
 
     if rt_raw is None or rt_raw.empty:
-        try: rt_raw = load_rt_kagglehub()
+        try: rt_raw = load_rt_kagglehub_sync()
         except Exception: rt_raw = pd.DataFrame()
     rt_std = std_rt(rt_raw)
 
@@ -113,9 +115,8 @@ def build_joined(rt_raw: pd.DataFrame|None=None):
         joined = joined.sample(SAMPLE_MAX, random_state=42)
     return imdb, rt_std, joined
 
-# ---------------- UI (helle Sidebar, modernes Styling) ----------------
+# ---------------- UI ----------------
 app_ui = ui.page_sidebar(
-    # Sidebar (positionsargument)
     ui.sidebar(
         ui.tags.style("""
         :root{--bg:#f7f8fb;--card:#ffffff;--muted:#6b7280;--line:#e8ebf3;--brand:#2563eb;--brand-weak:#e8efff}
@@ -160,7 +161,6 @@ app_ui = ui.page_sidebar(
         open={"desktop": "open", "mobile": "closed"},
     ),
 
-    # Hauptinhalt (positionsargument)
     ui.layout_column_wrap(
         ui.card(
             ui.card_header(ui.tags.div(id="page_title")),
@@ -175,7 +175,7 @@ app_ui = ui.page_sidebar(
 # ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Keep alive
+    # Keep alive (harmlos, aber hält Heartbeats am Leben)
     @reactive.effect
     def _keepalive():
         reactive.invalidate_later(KEEPALIVE_SECS)
@@ -188,27 +188,30 @@ def server(input: Inputs, output: Outputs, session: Session):
         store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":msg})
         ui.notification_show(msg, type="warning", duration=8)
 
-    # Start: Versuche Cache zu lesen, sonst Background-Build
-    def warm_start():
+    # --------- Async Warm-Start + Build ---------
+    async def warm_start_async():
+        # 1) Cache versuchen (non-blocking via to_thread)
         try:
-            imdb  = try_read_csv("imdb.csv")
-            rt    = try_read_csv("rt_std.csv")
-            joined= try_read_csv("joined.csv")
+            imdb  = await asyncio.to_thread(try_read_csv_sync, "imdb.csv")
+            rt    = await asyncio.to_thread(try_read_csv_sync, "rt_std.csv")
+            joined= await asyncio.to_thread(try_read_csv_sync, "joined.csv")
             if imdb is not None and rt is not None and joined is not None and not joined.empty:
                 store.set({"ready":True,"imdb":imdb,"rt":rt,"joined":joined,"error":""})
                 return
         except Exception:
             pass
-        # Kein Cache: baue im Hintergrund
-        threading.Thread(target=bg_build_and_cache, daemon=True).start()
+        # 2) Kein Cache: Live-Build
+        await build_and_cache_async()
 
-    def bg_build_and_cache(rt_override: pd.DataFrame|None=None):
+    async def build_and_cache_async(rt_override: pd.DataFrame|None=None):
         try:
-            imdb, rt, joined = build_joined(rt_override)
-            # Cache schreiben
-            save_csv(imdb,  "imdb.csv")
-            save_csv(rt,    "rt_std.csv")
-            save_csv(joined,"joined.csv")
+            # Alles Teure aus dem Event-Loop auslagern
+            imdb, rt, joined = await asyncio.to_thread(build_joined_sync, rt_override)
+            # Cache schreiben (auch im Thread, aber hier schnell genug)
+            await asyncio.to_thread(save_csv_sync, imdb,  "imdb.csv")
+            await asyncio.to_thread(save_csv_sync, rt,    "rt_std.csv")
+            await asyncio.to_thread(save_csv_sync, joined,"joined.csv")
+            # Jetzt im Loop: State + UI
             store.set({"ready":True,"imdb":imdb,"rt":rt,"joined":joined,"error":""})
             ui.notification_show("Daten geladen.", type="message", duration=4)
         except Exception as e:
@@ -224,33 +227,34 @@ def server(input: Inputs, output: Outputs, session: Session):
                 "rt_audience":[98,96,91,94],
                 "tconst":["tt0111161","tt0137523","tt1375666","tt0468569"],
             })
-            save_csv(demo, "joined.csv")
+            await asyncio.to_thread(save_csv_sync, demo, "joined.csv")
             store.set({"ready":True,"imdb":demo,"rt":demo[["title_norm","year","rt_tomato","rt_audience"]],
                        "joined":demo,"error":str(e)})
             ui.notification_show("Konnte Live-Daten nicht laden – Demo-Daten werden angezeigt.", type="warning", duration=8)
 
-    warm_start()  # kick-off beim Start
+    # Kickoff nach Session-Start
+    asyncio.get_running_loop().create_task(warm_start_async())
 
-    # Upload / Reload (asynchron + Cache)
+    # Upload / Reload — asynchron
     @reactive.effect
     @reactive.event(input.rt_upload)
-    def _on_upload():
+    async def _on_upload():
         f=input.rt_upload()
         if f:
             try:
-                df=pd.read_csv(f[0]["datapath"])
+                df= await asyncio.to_thread(pd.read_csv, f[0]["datapath"])
             except Exception as e:
                 set_error("Upload-Fehler beim Einlesen", e); return
             store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
             ui.notification_show("RT-CSV geladen – baue Daten zusammen …", type="message", duration=4)
-            threading.Thread(target=bg_build_and_cache, args=(df,), daemon=True).start()
+            await build_and_cache_async(df)
 
     @reactive.effect
     @reactive.event(input.reload_rt)
-    def _reload():
+    async def _reload():
         store.set({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
         ui.notification_show("Kagglehub wird neu geladen …", type="message", duration=4)
-        threading.Thread(target=bg_build_and_cache, daemon=True).start()
+        await build_and_cache_async()
 
     # Filter
     @reactive.Calc
@@ -285,7 +289,6 @@ def server(input: Inputs, output: Outputs, session: Session):
                 ui.tags.progress(max="100", value="25"),
             )
         if s["error"]:
-            # zeige Hinweis oberhalb des Inhalts
             warn = ui.tags.div(f"Hinweis: {s['error']}", class_="muted", style="margin-bottom:10px;")
         else:
             warn = ui.tags.div()
@@ -412,19 +415,22 @@ def server(input: Inputs, output: Outputs, session: Session):
     # Google Trends (mit Retry / Fallback)
     gt_df = reactive.Value(pd.DataFrame()); gt_cols = reactive.Value([]); gt_msg = reactive.Value("Noch keine Abfrage.")
 
-    def _trends_try(kws, tf, retries=4, base=2.5):
+    async def _trends_try_async(kws, tf, retries=4, base=2.5):
         try:
             from pytrends.request import TrendReq
         except Exception as e:
             return None, f"Pytrends fehlt: {e}"
-        pt=TrendReq(hl="de-DE", tz=0)
+        # TrendReq blockiert intern -> in Thread
+        def _run_once(_kws,_tf):
+            pt=TrendReq(hl="de-DE", tz=0)
+            pt.build_payload(_kws, timeframe=_tf)
+            return pt.interest_over_time()
         for i in range(retries):
             try:
-                pt.build_payload(kws, timeframe=tf)
-                d=pt.interest_over_time()
+                d = await asyncio.to_thread(_run_once, kws, tf)
                 if d is not None and not d.empty: return d, "OK"
             except Exception:
-                time.sleep(base*(2**i)+random.uniform(0,0.7))
+                await asyncio.sleep(base*(2**i)+random.uniform(0,0.7))
         return None, "Rate-Limit/Block?"
 
     def trends_ui():
@@ -450,14 +456,14 @@ def server(input: Inputs, output: Outputs, session: Session):
 
     @reactive.effect
     @reactive.event(input.gt_go)
-    def _gt():
+    async def _gt():
         kws=[k for k in [input.gt1(),input.gt2(),input.gt3(),input.gt4(),input.gt5()] if k and k.strip()]
         if not kws: gt_msg.set("Bitte Keywords eingeben."); return
         gt_msg.set("Hole Trends …")
-        d,msg=_trends_try(kws, input.gt_tf())
+        d,msg=await _trends_try_async(kws, input.gt_tf())
         if d is None or d.empty:
             k2=[re.sub(r"\b(19|20)\d{2}\b","",k).strip() for k in kws]
-            d,msg2=_trends_try(k2, input.gt_tf())
+            d,msg2=await _trends_try_async(k2, input.gt_tf())
             if d is None or d.empty:
                 gt_msg.set(f"Trends fehlgeschlagen. {msg2}"); gt_df.set(pd.DataFrame()); return
             gt_cols.set(k2); gt_msg.set("Trends OK (Fallback ohne Jahr)."); gt_df.set(d.reset_index()); return
