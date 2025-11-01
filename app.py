@@ -1,4 +1,4 @@
-# app.py — Movie Ratings (IMDb × RT via Kagglehub) — no-JS nav, shiny 1.5.0 compatible
+# app.py — Movie Ratings (IMDb × RT via Kagglehub) — shiny 1.5.0 kompatibel
 from __future__ import annotations
 import io, gzip, re, os, time, random, threading, datetime
 import numpy as np, pandas as pd, matplotlib
@@ -91,7 +91,7 @@ def build_joined(rt_raw: pd.DataFrame|None=None):
         joined = joined.sample(SAMPLE_MAX, random_state=42)
     return imdb, rt_std, joined
 
-# -------- UI (hell + echte Sidebar-Navigation, ohne JS) --------
+# -------- UI (helle Sidebar, ohne JS) --------
 app_ui = ui.page_sidebar(
     # 1) Sidebar (positionsargument)
     ui.sidebar(
@@ -125,7 +125,6 @@ app_ui = ui.page_sidebar(
         ui.input_checkbox("use_audience", "Audience-Score zusätzlich", False),
         ui.input_action_button("reload_rt", "RT-Daten neu laden"),
         ui.input_file("rt_upload", "oder RT-CSV hochladen", accept=[".csv"], multiple=False),
-        # In shiny 1.5.0: open = "open" | "closed" | "always" oder Dict
         open={"desktop": "open", "mobile": "closed"},
     ),
 
@@ -145,12 +144,12 @@ app_ui = ui.page_sidebar(
 # -------- Server --------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Keep-Alive gegen Idle-Timeout (ohne JS)
+    # Keep-Alive
     @reactive.effect
     def _keepalive():
         reactive.invalidate_later(KEEPALIVE_SECS)
 
-    # Daten-Cache (lädt im Hintergrund)
+    # Daten-Cache
     store = reactive.Value({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
 
     def bg_load(rt_override: pd.DataFrame|None=None):
@@ -217,7 +216,7 @@ def server(input: Inputs, output: Outputs, session: Session):
            "downloads":"Downloads","table":"Tabelle"}
         return ui.tags.h3(t.get(input.page(),"Überblick"))
 
-    # Seiteninhalt (Loader solange Store nicht ready)
+    # Seiteninhalt
     @output
     @render.ui
     def page_body():
@@ -245,7 +244,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         )
 
     # Plots
-    @output @render.plot
+    @output
+    @render.plot
     def p_avg():
         df=df_filtered(); vals={}
         if "averageRating" in df: vals["IMDb (x10)"]=df["averageRating"].dropna().mean()*10
@@ -257,7 +257,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("Durchschnittliche Bewertung (0–100)"); ax.set_ylabel("Score")
         return fig
 
-    @output @render.plot
+    @output
+    @render.plot
     def p_scatter():
         df=df_filtered()
         fig,ax=plt.subplots(figsize=(6,6))
@@ -272,7 +273,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("IMDb vs Rotten Tomatoes")
         return fig
 
-    @output @render.plot
+    @output
+    @render.plot
     def p_dist():
         df=df_filtered(); fig,ax=plt.subplots(figsize=(9,4))
         if "rt_tomato" not in df: ax.axis("off"); ax.text(0.5,0.5,"RT nicht verfügbar",ha="center",va="center"); return fig
@@ -285,7 +287,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.legend(); ax.set_xlim(0,100); ax.set_title("Bewertungsverteilung"); ax.set_xlabel("Score (0–100)")
         return fig
 
-    @output @render.plot
+    @output
+    @render.plot
     def p_genre():
         s=store.get(); imdb=s["imdb"] if s["ready"] else pd.DataFrame()
         fig,ax=plt.subplots(figsize=(9,4))
@@ -297,7 +300,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_ylabel("Ø (0–100)"); ax.set_ylim(0,100); ax.set_title("IMDb (≥50k) — Ø Genre (Top 12)")
         return fig
 
-    @output @render.plot
+    @output
+    @render.plot
     def p_decade():
         s=store.get(); imdb=s["imdb"] if s["ready"] else pd.DataFrame()
         fig,ax=plt.subplots(figsize=(9,4))
@@ -309,7 +313,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         return fig
 
     # Tabelle
-    @output @render.data_frame
+    @output
+    @render.data_frame
     def tbl():
         df=df_filtered().copy()
         if df.empty:
@@ -324,12 +329,14 @@ def server(input: Inputs, output: Outputs, session: Session):
         return df[cols].sort_values("Stimmen",ascending=False)
 
     # Downloads
-    @output @render.download(filename=lambda: f"joined_{datetime.date.today().isoformat()}.csv")
+    @output
+    @render.download(filename=lambda: f"joined_{datetime.date.today().isoformat()}.csv")
     def dl_joined():
         s=store.get(); df=s["joined"] if s["ready"] else pd.DataFrame()
         yield df.to_csv(index=False).encode("utf-8")
 
-    @output @render.download(filename=lambda: f"top20_{datetime.date.today().isoformat()}.csv")
+    @output
+    @render.download(filename=lambda: f"top20_{datetime.date.today().isoformat()}.csv")
     def dl_top20():
         s=store.get(); imdb=s["imdb"] if s["ready"] else pd.DataFrame()
         top=imdb.sort_values("numVotes",ascending=False).loc[:,["tconst","title","year","averageRating","numVotes"]].head(20)
@@ -337,6 +344,7 @@ def server(input: Inputs, output: Outputs, session: Session):
 
     # Google Trends (mit Retry/Fallback)
     gt_df = reactive.Value(pd.DataFrame()); gt_cols = reactive.Value([]); gt_msg = reactive.Value("Noch keine Abfrage.")
+
     def _trends_try(kws, tf, retries=4, base=2.5):
         try:
             from pytrends.request import TrendReq
@@ -388,10 +396,13 @@ def server(input: Inputs, output: Outputs, session: Session):
             gt_cols.set(k2); gt_msg.set("Trends OK (Fallback ohne Jahr)."); gt_df.set(d.reset_index()); return
         gt_cols.set(kws); gt_msg.set("Trends OK."); gt_df.set(d.reset_index())
 
-    @output @render.text
-    def gt_status(): return gt_msg.get()
+    @output
+    @render.text
+    def gt_status():
+        return gt_msg.get()
 
-    @output @render.plot
+    @output
+    @render.plot
     def gt_plot():
         d=gt_df.get(); fig,ax=plt.subplots(figsize=(9,4))
         if d is None or d.empty: ax.axis("off"); ax.text(0.5,0.5,"Noch keine Daten",ha="center",va="center"); return fig
@@ -401,7 +412,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.legend(); ax.set_title("Google Trends"); ax.set_xlabel("Datum"); ax.set_ylabel("Interesse (0–100)")
         return fig
 
-    @output @render.download(filename=lambda: f"google_trends_{datetime.date.today().isoformat()}.csv")
+    @output
+    @render.download(filename=lambda: f"google_trends_{datetime.date.today().isoformat()}.csv")
     def dl_trends():
         yield (gt_df.get() if gt_df.get() is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8")
 
