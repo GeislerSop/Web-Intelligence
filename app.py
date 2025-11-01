@@ -7,13 +7,13 @@ import matplotlib.pyplot as plt
 import requests
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# -------- Config (knapper & schneller) --------
+# -------- Config --------
 IMDB_BASE = "https://datasets.imdbws.com"
 RT_DATASET_ID = "stefanoleone992/rotten-tomatoes-movies-and-critic-reviews-dataset"
 RT_FILE_DEFAULT = os.getenv("RT_DATASET_FILE", "rotten_tomatoes_movies.csv")
-REQUEST_TIMEOUT = 45          # sec pro HTTP-Call
-SAMPLE_MAX      = 80000       # weiches Limit für erste Anzeige
-KEEPALIVE_SECS  = 20          # verhindert Idle-Kick durch Connect
+REQUEST_TIMEOUT = 45
+SAMPLE_MAX      = 80000
+KEEPALIVE_SECS  = 20
 
 # -------- Helpers --------
 def norm_title(t: str) -> str:
@@ -38,7 +38,7 @@ def std_rt(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["title_norm","year","rt_tomato","rt_audience"])
     L={c.lower():c for c in df.columns}
-    def pick(*xs): 
+    def pick(*xs):
         for x in xs:
             if x in L: return L[x]
     c_title=pick("movie_title","title","name")
@@ -92,9 +92,8 @@ def build_joined(rt_raw: pd.DataFrame|None=None):
     return imdb, rt_std, joined
 
 # -------- UI (hell + echte Sidebar-Navigation) --------
-# -------- UI (hell + echte Sidebar-Navigation) --------
 app_ui = ui.page_sidebar(
-    # <-- 1) Sidebar als POSITIONSargument (ohne sidebar=)
+    # 1) Sidebar (positionsargument)
     ui.sidebar(
         ui.tags.style("""
         body{background:#f7f8fb;color:#1a1a1a}
@@ -122,15 +121,16 @@ app_ui = ui.page_sidebar(
         ui.tags.hr(),
         ui.tags.div("Filter", class_="muted", style="margin-bottom:6px;"),
         ui.input_numeric("year_start", "Jahr von", 1980, min=1920, max=2025, step=1),
-        ui.input_numeric("year_end", "Jahr bis", 2025, min=1920, max=2025, step=1),
-        ui.input_numeric("min_votes", "Min. IMDb-Stimmen", value=50000, min=0, step=1000),
+        ui.input_numeric("year_end",   "Jahr bis",  2025, min=1920, max=2025, step=1),
+        ui.input_numeric("min_votes",  "Min. IMDb-Stimmen", value=50000, min=0, step=1000),
         ui.input_checkbox("use_audience", "Audience-Score zusätzlich", False),
         ui.input_action_button("reload_rt", "RT (Kagglehub) neu laden"),
         ui.input_file("rt_upload", "oder RT-CSV hochladen", accept=[".csv"], multiple=False),
-        open=True,
+        # FIX: open muss String oder Dict sein (nicht True/False)
+        open={"desktop": "open", "mobile": "closed"},
     ),
 
-    # <-- 2) Hauptinhalt als weiteres POSITIONSargument
+    # 2) Hauptinhalt (positionsargument)
     ui.layout_column_wrap(
         ui.card(
             ui.card_header(ui.tags.div(id="page_title")),
@@ -139,15 +139,14 @@ app_ui = ui.page_sidebar(
         fill=False,
     ),
 
-    # <-- 3) Danach erst Keyword-Args wie title=
+    # 3) Keyword-Args
     title="Movie Ratings",
 )
-
 
 # -------- Server --------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Sidebar-Menü: aktiv schalten
+    # Seiten-Navigation
     page = reactive.Value("overview")
     session.send_script("""
       const send=id=>Shiny.setInputValue('.__web_method__nav', { id });
@@ -166,13 +165,13 @@ def server(input: Inputs, output: Outputs, session: Session):
            "nav_gtrends":"gtrends","nav_downloads":"downloads","nav_table":"table"}
         if id in m: page.set(m[id]); session.send_custom_message("active",{"id":id})
 
-    # Keep-Alive gegen Idle-Timeout
+    # Keep-Alive
     @reactive.effect
     def _keepalive():
         reactive.invalidate_later(KEEPALIVE_SECS)
         session.send_custom_message("active", {"id":"nav_overview"})
 
-    # Daten-Cache (lädt im Hintergrund)
+    # Daten-Cache
     store = reactive.Value({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
 
     def bg_load(rt_override: pd.DataFrame|None=None):
@@ -191,8 +190,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                 "rt_audience":[98,96,91,94],
                 "tconst":["tt0111161","tt0137523","tt1375666","tt0468569"],
             })
-            store.set({"ready":True,"imdb":demo,"rt":demo[["title_norm","year","rt_tomato","rt_audience"]],
-                       "joined":demo,"error":str(e)})
+            store.set({"ready":True,"imdb":demo,"rt":demo[["title_norm","year","rt_tomato","rt_audience"]],"joined":demo,"error":str(e)})
 
     threading.Thread(target=bg_load, daemon=True).start()
 
@@ -239,7 +237,7 @@ def server(input: Inputs, output: Outputs, session: Session):
            "downloads":"Downloads","table":"Tabelle"}
         return ui.tags.h3(t.get(page.get(),"Überblick"))
 
-    # Seiteninhalt (Loader solange Store nicht ready)
+    # Seiteninhalt
     @output
     @render.ui
     def page_body():
@@ -255,7 +253,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if p=="table":     return ui.output_data_frame("tbl")
         return ui.div("—")
 
-    # KPI helper
+    # KPIs
     def kpi_ui(df):
         imdb_mean = (df["averageRating"].dropna().mean()*10) if "averageRating" in df.columns and df["averageRating"].notna().any() else np.nan
         rt_mean   = df["rt_tomato"].dropna().mean() if "rt_tomato" in df.columns and df["rt_tomato"].notna().any() else np.nan
@@ -357,7 +355,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         top=imdb.sort_values("numVotes",ascending=False).loc[:,["tconst","title","year","averageRating","numVotes"]].head(20)
         yield top.to_csv(index=False).encode("utf-8")
 
-    # Google Trends (mit Retry/Fallback)
+    # Google Trends
     gt_df = reactive.Value(pd.DataFrame()); gt_cols = reactive.Value([]); gt_msg = reactive.Value("Noch keine Abfrage.")
     def _trends_try(kws, tf, retries=4, base=2.5):
         try:
