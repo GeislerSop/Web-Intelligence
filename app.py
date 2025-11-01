@@ -216,13 +216,15 @@ def server(input: Inputs, output: Outputs, session: Session):
            "downloads":"Downloads","table":"Tabelle"}
         return ui.tags.h3(t.get(input.page(),"Überblick"))
 
-    # Seiteninhalt
+    # Seiteninhalt (Loader solange Store nicht ready)
     @output
     @render.ui
     def page_body():
         if not store.get()["ready"]:
-            return ui.div(ui.tags.div("Lade Daten …", class_="muted", style="margin-bottom:8px;"),
-                          ui.progress(id="p1", value=25))
+            return ui.div(
+                ui.tags.div("Lade Daten …", class_="muted", style="margin-bottom:8px;"),
+                ui.tags.progress(max="100", value="25"),  # <-- FIX: statt ui.progress
+            )
         p=input.page()
         if p=="overview":  return ui.div(kpi_ui(df_filtered()), ui.output_plot("p_avg"))
         if p=="compare":   return ui.div(ui.output_plot("p_scatter"), ui.output_plot("p_dist"))
