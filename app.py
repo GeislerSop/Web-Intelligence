@@ -1,4 +1,4 @@
-# app.py — Movie Ratings (IMDb × RT via Kagglehub)
+# app.py — Movie Ratings (IMDb × RT via Kagglehub) — no-JS nav, shiny 1.5.0 compatible
 from __future__ import annotations
 import io, gzip, re, os, time, random, threading, datetime
 import numpy as np, pandas as pd, matplotlib
@@ -91,7 +91,7 @@ def build_joined(rt_raw: pd.DataFrame|None=None):
         joined = joined.sample(SAMPLE_MAX, random_state=42)
     return imdb, rt_std, joined
 
-# -------- UI (hell + echte Sidebar-Navigation) --------
+# -------- UI (hell + echte Sidebar-Navigation, ohne JS) --------
 app_ui = ui.page_sidebar(
     # 1) Sidebar (positionsargument)
     ui.sidebar(
@@ -101,22 +101,21 @@ app_ui = ui.page_sidebar(
         .card{background:#fff;border:1px solid #e8ebf3;border-radius:14px;box-shadow:0 8px 18px rgba(16,24,40,.06)}
         .btn{background:#2563eb;color:#fff;border-radius:10px;border:none}
         h1{margin:0 0 8px 0;font-weight:700;color:#0f172a}
-        .menu a{display:block;padding:10px 12px;border-radius:10px;color:#334155;text-decoration:none;margin-bottom:6px}
-        .menu a.active{background:#e8efff;color:#1e3a8a}
         .muted{color:#6b7280;font-size:12px}
         """),
         ui.tags.h2("Movie Ratings", style="margin:6px 0 18px 0;"),
-        ui.tags.div(
-            ui.tags.div("Navigation", class_="muted"),
-            ui.tags.div(
-                ui.tags.a("Überblick", href="#", id="nav_overview", class_="menu-link"),
-                ui.tags.a("IMDb ↔ RT", href="#", id="nav_compare", class_="menu-link"),
-                ui.tags.a("Genres/Jahrzehnte", href="#", id="nav_trends", class_="menu-link"),
-                ui.tags.a("Google Trends", href="#", id="nav_gtrends", class_="menu-link"),
-                ui.tags.a("Downloads", href="#", id="nav_downloads", class_="menu-link"),
-                ui.tags.a("Tabelle", href="#", id="nav_table", class_="menu-link"),
-                class_="menu"
-            )
+        ui.input_radio_buttons(
+            "page", "Navigation",
+            choices={
+                "overview":"Überblick",
+                "compare":"IMDb ↔ RT",
+                "trends":"Genres/Jahrzehnte",
+                "gtrends":"Google Trends",
+                "downloads":"Downloads",
+                "table":"Tabelle",
+            },
+            selected="overview",
+            inline=False
         ),
         ui.tags.hr(),
         ui.tags.div("Filter", class_="muted", style="margin-bottom:6px;"),
@@ -124,9 +123,9 @@ app_ui = ui.page_sidebar(
         ui.input_numeric("year_end",   "Jahr bis",  2025, min=1920, max=2025, step=1),
         ui.input_numeric("min_votes",  "Min. IMDb-Stimmen", value=50000, min=0, step=1000),
         ui.input_checkbox("use_audience", "Audience-Score zusätzlich", False),
-        ui.input_action_button("reload_rt", "RT (Kagglehub) neu laden"),
+        ui.input_action_button("reload_rt", "RT-Daten neu laden"),
         ui.input_file("rt_upload", "oder RT-CSV hochladen", accept=[".csv"], multiple=False),
-        # FIX: open muss String oder Dict sein (nicht True/False)
+        # In shiny 1.5.0: open = "open" | "closed" | "always" oder Dict
         open={"desktop": "open", "mobile": "closed"},
     ),
 
@@ -146,32 +145,12 @@ app_ui = ui.page_sidebar(
 # -------- Server --------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Seiten-Navigation
-    page = reactive.Value("overview")
-    session.send_script("""
-      const send=id=>Shiny.setInputValue('.__web_method__nav', { id });
-      for(const id of ['nav_overview','nav_compare','nav_trends','nav_gtrends','nav_downloads','nav_table']){
-        const el=document.getElementById(id); if(!el) continue;
-        el.addEventListener('click',(e)=>{e.preventDefault(); send(id);});
-      }
-      Shiny.addCustomMessageHandler('active',({id})=>{
-        document.querySelectorAll('.menu-link').forEach(a=>a.classList.remove('active'));
-        const el=document.getElementById(id); if(el) el.classList.add('active');
-      });
-    """)
-    @session.register_web_method
-    def nav(id:str):
-        m={"nav_overview":"overview","nav_compare":"compare","nav_trends":"trends",
-           "nav_gtrends":"gtrends","nav_downloads":"downloads","nav_table":"table"}
-        if id in m: page.set(m[id]); session.send_custom_message("active",{"id":id})
-
-    # Keep-Alive
+    # Keep-Alive gegen Idle-Timeout (ohne JS)
     @reactive.effect
     def _keepalive():
         reactive.invalidate_later(KEEPALIVE_SECS)
-        session.send_custom_message("active", {"id":"nav_overview"})
 
-    # Daten-Cache
+    # Daten-Cache (lädt im Hintergrund)
     store = reactive.Value({"ready":False,"imdb":None,"rt":None,"joined":None,"error":""})
 
     def bg_load(rt_override: pd.DataFrame|None=None):
@@ -190,7 +169,8 @@ def server(input: Inputs, output: Outputs, session: Session):
                 "rt_audience":[98,96,91,94],
                 "tconst":["tt0111161","tt0137523","tt1375666","tt0468569"],
             })
-            store.set({"ready":True,"imdb":demo,"rt":demo[["title_norm","year","rt_tomato","rt_audience"]],"joined":demo,"error":str(e)})
+            store.set({"ready":True,"imdb":demo,"rt":demo[["title_norm","year","rt_tomato","rt_audience"]],
+                       "joined":demo,"error":str(e)})
 
     threading.Thread(target=bg_load, daemon=True).start()
 
@@ -235,16 +215,16 @@ def server(input: Inputs, output: Outputs, session: Session):
         t={"overview":"Überblick","compare":"IMDb ↔ Rotten Tomatoes",
            "trends":"Genres & Jahrzehnte","gtrends":"Google Trends",
            "downloads":"Downloads","table":"Tabelle"}
-        return ui.tags.h3(t.get(page.get(),"Überblick"))
+        return ui.tags.h3(t.get(input.page(),"Überblick"))
 
-    # Seiteninhalt
+    # Seiteninhalt (Loader solange Store nicht ready)
     @output
     @render.ui
     def page_body():
         if not store.get()["ready"]:
             return ui.div(ui.tags.div("Lade Daten …", class_="muted", style="margin-bottom:8px;"),
                           ui.progress(id="p1", value=25))
-        p=page.get()
+        p=input.page()
         if p=="overview":  return ui.div(kpi_ui(df_filtered()), ui.output_plot("p_avg"))
         if p=="compare":   return ui.div(ui.output_plot("p_scatter"), ui.output_plot("p_dist"))
         if p=="trends":    return ui.div(ui.output_plot("p_genre"), ui.output_plot("p_decade"))
@@ -355,7 +335,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         top=imdb.sort_values("numVotes",ascending=False).loc[:,["tconst","title","year","averageRating","numVotes"]].head(20)
         yield top.to_csv(index=False).encode("utf-8")
 
-    # Google Trends
+    # Google Trends (mit Retry/Fallback)
     gt_df = reactive.Value(pd.DataFrame()); gt_cols = reactive.Value([]); gt_msg = reactive.Value("Noch keine Abfrage.")
     def _trends_try(kws, tf, retries=4, base=2.5):
         try:
