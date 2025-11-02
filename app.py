@@ -1,9 +1,9 @@
-# app.py — Movie Ratings Dashboard (Posit Connect, ohne Histogramme)
+# app.py — Movie Ratings Dashboard (Posit Connect, ohne Histogramme + Warning-Fix)
 # nutzt 3 CSVs aus ./outputs:
 #   joined_imdb_rt.csv | top20_by_votes_imdb.csv | google_trends_top5.csv
 
 from __future__ import annotations
-import re, logging
+import re, logging, warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -11,6 +11,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
+
+# --- gezieltes Silencing für fremde Aufrufer von numpy.histogram(density=True)
+np.seterr(divide="ignore", invalid="ignore")
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    message="invalid value encountered in divide",
+    module=r"numpy\.lib\._histograms_impl"
+)
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -38,7 +47,7 @@ CSV_GT     = _find("gtr")
 def read_csv_local(path: Path | str) -> pd.DataFrame:
     try:
         p = str(path) if isinstance(path, str) else str(path)
-        # ggf. sep=";" / encoding anpassen
+        # ggf. sep=";" / encoding="utf-8-sig" anpassen
         df = pd.read_csv(p)
         LOG.info(f"Loaded {p} → shape={df.shape}")
         return df
