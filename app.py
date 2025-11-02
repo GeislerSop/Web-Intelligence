@@ -1,13 +1,7 @@
-# app.py — Movie Ratings Dashboard (einfach & klar)
-# CSVs:
-#   outputs/joined_imdb_rt.csv
-#   outputs/rotten_tomatoes_movies.csv (oder raw/... als Fallback)
-#   outputs/top20_by_votes_imdb.csv
-#   outputs/google_trends_top5.csv
-
+# app.py — Movie Ratings Dashboard (nutzt rt_metrics.csv bevorzugt)
 from __future__ import annotations
 
-import os, re, logging, warnings
+import re, logging, warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -16,7 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# Warnings reduzieren
+# Warnings leiser
 np.seterr(all="ignore")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
@@ -29,18 +23,18 @@ BASE = Path(__file__).resolve().parent
 
 def _find(*candidates: Path) -> Path|None:
     for p in candidates:
-        if p.exists():
+        if p and p.exists():
             return p
     return None
 
-CSV_JOINED = _find(BASE/"outputs/joined_imdb_rt.csv", BASE/"joined_imdb_rt.csv")
-CSV_RT_RAW = _find(BASE/"outputs/rotten_tomatoes_movies.csv", BASE/"raw/rotten_tomatoes_movies.csv")
-CSV_TOP20  = _find(BASE/"outputs/top20_by_votes_imdb.csv", BASE/"top20_by_votes_imdb.csv")
-CSV_GTR    = _find(BASE/"outputs/google_trends_top5.csv", BASE/"google_trends_top5.csv")
+CSV_JOINED   = _find(BASE/"outputs/joined_imdb_rt.csv", BASE/"joined_imdb_rt.csv")
+CSV_RT_METR  = _find(BASE/"outputs/rt_metrics.csv")
+CSV_RT_RAW   = _find(BASE/"outputs/rotten_tomatoes_movies.csv", BASE/"raw/rotten_tomatoes_movies.csv")
+CSV_TOP20    = _find(BASE/"outputs/top20_by_votes_imdb.csv", BASE/"top20_by_votes_imdb.csv")
+CSV_GTR      = _find(BASE/"outputs/google_trends_top5.csv", BASE/"google_trends_top5.csv")
 
 def _read_csv(p: Path|None) -> pd.DataFrame:
-    if p is None:
-        return pd.DataFrame()
+    if p is None: return pd.DataFrame()
     try:
         df = pd.read_csv(p)
         LOG.info(f"Loaded {p} shape={df.shape}")
@@ -49,8 +43,9 @@ def _read_csv(p: Path|None) -> pd.DataFrame:
         LOG.exception(f"CSV read failed: {p} -> {e}")
         return pd.DataFrame()
 
-joined_raw = _read_csv(CSV_JOINED)     # IMDb-Basis (+ evtl. RT)
-rt_raw     = _read_csv(CSV_RT_RAW)     # RT-Rohdaten
+joined_raw = _read_csv(CSV_JOINED)
+rt_metrics = _read_csv(CSV_RT_METR)
+rt_raw     = _read_csv(CSV_RT_RAW)
 top20_raw  = _read_csv(CSV_TOP20)
 gtr_raw    = _read_csv(CSV_GTR)
 
@@ -69,9 +64,9 @@ def to100(x):
     except:
         return np.nan
 
-def std_rt(df: pd.DataFrame) -> pd.DataFrame:
-    """Standardisiere RT-Rohdaten → title_norm, year, rt_tomato, rt_audience (nur bis 2020)."""
-    if df is None or df.empty:
+def std_rt_from_raw(df: pd.DataFrame) -> pd.DataFrame:
+    """Fallback: RT-Rohdatei in Standardform bringen."""
+    if df.empty:
         return pd.DataFrame(columns=["title_norm","year","rt_tomato","rt_audience"])
     L={c.lower():c for c in df.columns}
     def pick(*xs):
@@ -80,7 +75,7 @@ def std_rt(df: pd.DataFrame) -> pd.DataFrame:
     c_title=pick("movie_title","title","name")
     c_year =pick("original_release_year","year","release_year")
     c_info =pick("movie_info")
-    c_tom =pick("tomatometer_rating","tomato_score","tomatometer","rotten_tomatoes","rt","rt_score")
+    c_tom =pick("tomatometer_rating","tomato_score","tomatometer","rt","rt_score")
     c_aud =pick("audience_rating","audience_score","audiencescore")
     keep=[c for c in [c_title,c_year,c_info,c_tom,c_aud] if c]
     d=df[keep].copy() if keep else df.iloc[0:0].copy()
@@ -97,35 +92,52 @@ def std_rt(df: pd.DataFrame) -> pd.DataFrame:
     d["year"]=pd.to_numeric(d.get("year",pd.Series(index=d.index)),errors="coerce")
     if "info" in d and d["year"].isna().all():
         d["year"]=d["info"].astype(str).str.extract(r"\b(19|20)\d{2}\b",expand=False).astype(float)
-    # Auf 2020 begrenzen
-    d = d[d["year"].fillna(0) <= 2020]
+    d = d[d["year"].fillna(0) <= 2020]  # RT bis 2020
     d["rt_tomato"]=d.get("rt_tomato_raw",pd.Series(index=d.index)).map(to100)
     d["rt_audience"]=d.get("rt_audience_raw",pd.Series(index=d.index)).map(to100)
-    out = d[["title_norm","year","rt_tomato","rt_audience"]].dropna(subset=["title_norm"]).drop_duplicates()
-    return out
+    return d[["title_norm","year","rt_tomato","rt_audience"]].dropna(subset=["title_norm"]).drop_duplicates()
 
-# --- vorbereiten: joined (IMDb) + RT-Standard
+def std_rt_from_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Bevorzugt: aus rt_metrics.csv lesen und vereinheitlichen."""
+    need = {"title","title_norm","year","rt_tomato","rt_audience"}
+    if df.empty or not need.issubset(set(df.columns)):
+        return pd.DataFrame()
+    d = df.copy()
+    d["title_norm"] = d["title_norm"].astype(str).map(norm_title)
+    d["year"] = pd.to_numeric(d["year"], errors="coerce")
+    d = d[d["year"].fillna(0) <= 2020]  # RT bis 2020
+    d["rt_tomato"]   = pd.to_numeric(d["rt_tomato"], errors="coerce").clip(0,100)
+    d["rt_audience"] = pd.to_numeric(d["rt_audience"], errors="coerce").clip(0,100)
+    return d[["title_norm","year","rt_tomato","rt_audience"]].dropna(subset=["title_norm"]).drop_duplicates()
+
+# --- IMDb vorbereiten & RT-Quelle bestimmen
 if not joined_raw.empty and "title_norm" not in joined_raw.columns and "title" in joined_raw.columns:
     joined_raw["title_norm"] = joined_raw["title"].map(norm_title)
 
-rt_std = std_rt(rt_raw)
+rt_std = std_rt_from_metrics(rt_metrics)
+RT_SOURCE = "rt_metrics.csv"
+if rt_std.empty:
+    rt_std = std_rt_from_raw(rt_raw)
+    RT_SOURCE = "rotten_tomatoes_movies.csv (raw)"
 
 def joined_for_visuals() -> pd.DataFrame:
-    """IMDb-Daten + (sanft) RT-Ergänzung. Einheitliche Spaltennamen für UI."""
+    """IMDb + RT zusammenführen; UI-Spaltennamen setzen."""
     if joined_raw.empty:
         return joined_raw
     df = joined_raw.copy()
-    # Einheitliche Namen
+
+    # einheitliche Namen
     if "year" not in df.columns and "Year" in df.columns:
         df.rename(columns={"Year":"year"}, inplace=True)
     if "numVotes" not in df.columns and "votes" in df.columns:
         df.rename(columns={"votes":"numVotes"}, inplace=True)
 
-    # merge RT (nur bis 2020)
+    # merge RT (nur bis 2020, das macht rt_std bereits)
     cols = ["title_norm","year"]
     if "year" in df: df["year"]=pd.to_numeric(df["year"], errors="coerce")
     if not rt_std.empty and all(c in df.columns for c in cols):
         df = df.merge(rt_std, on=cols, how="left", suffixes=("","_rtstd"))
+        # vorhandene RT behalten, fehlende füllen
         if "rt_tomato" not in df and "rt_tomato_rtstd" in df:
             df["rt_tomato"] = df["rt_tomato_rtstd"]
         else:
@@ -135,11 +147,11 @@ def joined_for_visuals() -> pd.DataFrame:
         else:
             df["rt_audience"] = df["rt_audience"].fillna(df.get("rt_audience_rtstd"))
 
-    # Einheitliche, DEUTLICHE Namen für UI/Plots
+    # UI-Spalten
     if "averageRating" in df: df["IMDb_Score_100"] = (df["averageRating"]*10).clip(0,100)
     if "rt_tomato" in df:     df["RT_Tomatometer"] = df["rt_tomato"].clip(0,100)
     if "rt_audience" in df:   df["RT_Audience"] = df["rt_audience"].clip(0,100)
-    if "numVotes" in df:      df["IMDb_Votes"] = df["numVotes"].astype("Int64")
+    if "numVotes" in df:      df["IMDb_Votes"] = pd.to_numeric(df["numVotes"], errors="coerce").astype("Int64")
     return df
 
 # ---------------- UI ----------------
@@ -188,20 +200,23 @@ app_ui = ui.page_sidebar(
 # ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Status
+    # Status / Quelle anzeigen
     @output
     @render.ui
     def status_files():
         def li(ok, text): return ui.tags.li((("✅ " if ok else "❌ ") + text))
         rows = [
             li(CSV_JOINED is not None, f"joined: {CSV_JOINED} (shape={tuple(joined_raw.shape)})"),
+            li(CSV_RT_METR is not None, f"rt_metrics: {CSV_RT_METR} (shape={tuple(rt_metrics.shape)})"),
             li(CSV_RT_RAW is not None, f"rt_raw: {CSV_RT_RAW} (shape={tuple(rt_raw.shape)})"),
-            li(CSV_TOP20  is not None, f"top20 : {CSV_TOP20}  (shape={tuple(top20_raw.shape)})"),
-            li(CSV_GTR    is not None, f"gtr   : {CSV_GTR}    (shape={tuple(gtr_raw.shape)})"),
+            li(CSV_TOP20 is not None, f"top20 : {CSV_TOP20}  (shape={tuple(top20_raw.shape)})"),
+            li(CSV_GTR is not None, f"gtr   : {CSV_GTR}    (shape={tuple(gtr_raw.shape)})"),
+            ui.tags.li(f"RT-Quelle aktiv: {RT_SOURCE}"),
+            ui.tags.li(f"RT-Datensätze (≤2020): {len(rt_std):,}".replace(",", ".")),
         ]
         return ui.tags.small(ui.tags.ul(*rows, style="margin:0;padding-left:18px;"))
 
-    # Gefilterte Datensichten
+    # Daten-Sichten
     @reactive.Calc
     def df_joined():
         df = joined_for_visuals().copy()
@@ -278,7 +293,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         cards.append(vb("RT-Abdeckung", f"{share:.1f}%"))
         return ui.layout_column_wrap(*cards, fill=False)
 
-    # Übersicht: Ø-Balken + CCDF (einfach)
+    # Übersicht: Balken + CCDF
     @output
     @render.plot
     def p_avg_bars():
@@ -297,7 +312,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             values.append(d_rt["RT_Audience"].mean())
         if not values:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
-        colors = ["#2563EB","#F59E0B","#10B981"][:len(values)]  # kräftig
+        colors = ["#2563EB","#F59E0B","#10B981"][:len(values)]
         ax.bar(labels, values, color=colors)
         for i,v in enumerate(values):
             ax.text(i, v+1, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
@@ -317,14 +332,14 @@ def server(input: Inputs, output: Outputs, session: Session):
         if x.size == 0:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
         xs = np.sort(x); ys = np.arange(1, xs.size+1) / xs.size
-        ax.plot(xs, 1-ys, color="#2563EB", linewidth=2)  # kräftig
+        ax.plot(xs, 1-ys, color="#2563EB", linewidth=2)
         ax.set_xlabel("log10(Stimmen)  (3=1.000, 4=10.000, 5=100.000)")
         ax.set_ylabel("Anteil der Filme ≥ X")
         ax.set_title(f"Wie viele Stimmen haben die Filme? (N={x.size:,})".replace(",", "."))
         ax.set_ylim(0,1)
         return fig
 
-    # Vergleich: einfacher Scatter + Mittelwert-Differenz pro IMDb-Bin (Linie)
+    # Vergleich: Scatter + Ø-Differenz je Bin
     @output
     @render.plot
     def p_scatter_simple():
@@ -347,10 +362,9 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig, ax = plt.subplots(figsize=(9,3.8))
         if d.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
-        # IMDb in 10-Punkte-Bins und Mittelwert der Differenz pro Bin
         d["bin"] = (d["IMDb_Score_100"]//10*10).astype(int).clip(0,90)
         s = d.groupby("bin").apply(lambda x: (x["RT_Tomatometer"] - x["IMDb_Score_100"]).mean())
-        ax.plot(s.index, s.values, marker="o", color="#EF4444", linewidth=2)  # kräftig
+        ax.plot(s.index, s.values, marker="o", color="#EF4444", linewidth=2)
         ax.axhline(0, color="#111827", linewidth=1)
         ax.set_xticks(list(range(0,101,10)))
         ax.set_xlabel("IMDb (gerundet, 0–100)")
@@ -387,11 +401,10 @@ def server(input: Inputs, output: Outputs, session: Session):
         counts = cats.value_counts().reindex(["Fresh","Rotten"]).fillna(0)
         if counts.sum() == 0:
             ax.axis("off"); ax.text(0.5,0.5,"Keine RT-Werte",ha="center",va="center"); return fig
-        colors = ["#10B981","#EF4444"]  # grün/rot
-        ax.pie(counts.values, labels=[f"{k} ({int(v)})" for k,v in counts.items()], autopct="%1.0f%%",
-               startangle=90, colors=colors, textprops={"fontsize":11})
-        ax.set_title("RT-Verteilung (Fresh ≥ 60)")
-        ax.axis("equal")
+        colors = ["#10B981","#EF4444"]
+        ax.pie(counts.values, labels=[f"{k} ({int(v)})" for k,v in counts.items()],
+               autopct="%1.0f%%", startangle=90, colors=colors, textprops={"fontsize":11})
+        ax.set_title("RT-Verteilung (Fresh ≥ 60)"); ax.axis("equal")
         return fig
 
     # Trends (IMDb)
@@ -474,7 +487,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off"); ax.text(0.5,0.5,"Keine Trends-Daten",ha="center",va="center"); return fig
         if "date" in d.columns: d = d.set_index("date")
         else: d = d.set_index(d.columns[0])
-        for i,c in enumerate(d.columns):
+        for c in d.columns:
             ax.plot(pd.to_datetime(d.index), d[c], label=c, linewidth=2)
         ax.legend(fontsize=8); ax.set_title("Google Trends (Top 5)")
         ax.set_xlabel("Datum"); ax.set_ylabel("Interesse (0–100)")
@@ -486,7 +499,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = gtr_raw.copy()
         return d if not d.empty else pd.DataFrame(columns=["date","kw1","kw2","kw3","kw4","kw5"])
 
-    # Tabelle (gefiltert) – eindeutige Spalten
+    # Tabelle (gefiltert)
     @output
     @render.data_frame
     def tbl_all():
@@ -501,7 +514,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             if c not in d.columns: d[c]=pd.NA
         return d[cols].sort_values("IMDb_Votes", ascending=False)
 
-    # RT-only Seite (nur RT-Rohdaten, bis 2020)
+    # RT-only Seite (nur RT, bis 2020)
     @output
     @render.plot
     def p_rt_only_avg():
