@@ -1,46 +1,72 @@
-# app.py — Movie Ratings (Server-Shiny on Posit, portable for Shinylive)
-# Verwendet drei vorkonstruierte CSVs aus ./outputs/:
-#   - joined_imdb_rt.csv      (Haupttabelle: IMDb × RottenTomatoes)
-#   - top20_by_votes_imdb.csv (Top-20-Liste nach IMDb-Stimmen)
-#   - google_trends_top5.csv  (Zeitreihen von 3–5 Keywords)
-
 from __future__ import annotations
-import io, re, os, sys
+import io, re, os, sys, logging
 from pathlib import Path
-import numpy as np
-import pandas as pd
-import matplotlib
+import numpy as np, pandas as pd, matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# ------------------------------------------------------------
-# Portable CSV-Loader: Server liest von Platte, Shinylive via HTTP
-# ------------------------------------------------------------
+# Logging für Posit-Logs
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
+LOG = logging.getLogger("app")
+
+# Runtime-Erkennung + optionales Pyodide-Patching (unschädlich auf Server)
 IN_BROWSER = ("__pyodide__" in sys.modules) or os.environ.get("PYODIDE") == "1"
 try:
-    # Für Shinylive (Browser): requests → fetch
     import pyodide_http  # type: ignore
     if IN_BROWSER:
         pyodide_http.patch_all()
 except Exception:
     pass
 
+# ---- Pfade robust bestimmen
 BASE_DIR = Path(__file__).resolve().parent
-CSV_JOINED = BASE_DIR / "outputs" / "joined_imdb_rt.csv"
-CSV_TOP20  = BASE_DIR / "outputs" / "top20_by_votes_imdb.csv"
-CSV_GT     = BASE_DIR / "outputs" / "google_trends_top5.csv"
+CANDIDATES = [
+    BASE_DIR / "outputs",
+    Path.cwd() / "outputs",          # falls Working-Dir differiert
+    BASE_DIR,                         # fallback (selbes Verzeichnis)
+]
+
+FILENAMES = {
+    "joined": "joined_imdb_rt.csv",
+    "top20":  "top20_by_votes_imdb.csv",
+    "gtr":    "google_trends_top5.csv",
+}
+
+def find_file(name_key: str) -> Path:
+    fname = FILENAMES[name_key]
+    for root in CANDIDATES:
+        p = root / fname
+        if p.exists():
+            LOG.info(f"Found {name_key} at: {p}")
+            return p
+    # Letzter Versuch: relative Zeichenkette für Browser-Load
+    p = (Path("outputs") / fname)
+    LOG.warning(f"{name_key} not found in {CANDIDATES}; using relative path {p}")
+    return p
+
+CSV_JOINED = find_file("joined")
+CSV_TOP20  = find_file("top20")
+CSV_GT     = find_file("gtr")
 
 def read_csv_portable(path: Path | str) -> pd.DataFrame:
     """Shinylive: HTTP-fetch; Server: direkt von Platte."""
-    if IN_BROWSER:
-        url = path.as_posix() if isinstance(path, Path) else str(path)
-        r = requests.get(url, timeout=45); r.raise_for_status()
-        return pd.read_csv(io.BytesIO(r.content))
-    else:
-        p = str(path) if isinstance(path, str) else str(path)
-        return pd.read_csv(p)
+    try:
+        if IN_BROWSER:
+            url = path.as_posix() if isinstance(path, Path) else str(path)
+            r = requests.get(url, timeout=45); r.raise_for_status()
+            df = pd.read_csv(io.BytesIO(r.content))
+        else:
+            p = str(path) if isinstance(path, str) else str(path)
+            # CSVs sind idR. UTF-8; wenn nötig, hier encoding="utf-8-sig" setzen
+            df = pd.read_csv(p)
+        LOG.info(f"Loaded CSV {path} → shape={df.shape}")
+        return df
+    except Exception as e:
+        LOG.exception(f"Failed to read CSV {path}: {e}")
+        return pd.DataFrame()
+
 
 # ---------------- Config ----------------
 SAMPLE_MAX = 80_000  # weiches Limit für Interaktivität
