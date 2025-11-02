@@ -1,11 +1,4 @@
-shiny>=1.0.0
+shiny>=1.5.0
 pandas>=2.0
 numpy>=1.24
 matplotlib>=3.8
-requests>=2.31
-kagglehub>=0.1.7
-pytrends>=4.9.2
-
-# optional, aber empfehlenswert:
-aiohttp>=3.9          # für async HTTP (Shiny intern nutzt es)
-nest-asyncio>=1.6.0   # wichtig auf Posit Connect, falls Loop verschachtelt wird
