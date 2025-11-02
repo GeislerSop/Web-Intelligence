@@ -1,6 +1,16 @@
 # app.py — Movie Ratings Dashboard (Posit Connect, ohne Histogramme + Warning-Fix)
 # nutzt 3 CSVs aus ./outputs:
 #   joined_imdb_rt.csv | top20_by_votes_imdb.csv | google_trends_top5.csv
+# app.py – Header-Patch: Warnings & NumPy-Errors global unterdrücken (muss GANZ oben stehen!)
+import warnings, os
+# falls Connect das env respektiert:
+os.environ.setdefault("PYTHONWARNINGS", "ignore::RuntimeWarning")
+# Python-Warnings unterdrücken (bevor numpy/matplotlib geladen werden)
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# jetzt erst NumPy/Matplotlib laden und NumPy-Fehlerzustand dämpfen
+import numpy as np
+np.seterr(all="ignore")  # auch divide/invalid etc. global ignorieren
 
 from __future__ import annotations
 import re, logging, warnings
