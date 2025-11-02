@@ -1,4 +1,4 @@
-# app.py — Movie Ratings Dashboard (Posit Connect)
+# app.py — Movie Ratings Dashboard (Posit Connect, ohne Histogramme)
 # nutzt 3 CSVs aus ./outputs:
 #   joined_imdb_rt.csv | top20_by_votes_imdb.csv | google_trends_top5.csv
 
@@ -19,11 +19,8 @@ LOG = logging.getLogger("movie-app")
 # ---------------- Pfade + Loader ----------------
 BASE_DIR = Path(__file__).resolve().parent
 CANDIDATES = [BASE_DIR / "outputs", Path.cwd() / "outputs", BASE_DIR]
-FILES = {
-    "joined": "joined_imdb_rt.csv",
-    "top20":  "top20_by_votes_imdb.csv",
-    "gtr":    "google_trends_top5.csv",
-}
+FILES = {"joined":"joined_imdb_rt.csv","top20":"top20_by_votes_imdb.csv","gtr":"google_trends_top5.csv"}
+
 def _find(key: str) -> Path:
     fname = FILES[key]
     for root in CANDIDATES:
@@ -41,7 +38,7 @@ CSV_GT     = _find("gtr")
 def read_csv_local(path: Path | str) -> pd.DataFrame:
     try:
         p = str(path) if isinstance(path, str) else str(path)
-        # falls Semikolon: pd.read_csv(p, sep=";")
+        # ggf. sep=";" / encoding anpassen
         df = pd.read_csv(p)
         LOG.info(f"Loaded {p} → shape={df.shape}")
         return df
@@ -65,20 +62,6 @@ if not joined_raw.empty and "title_norm" not in joined_raw.columns and "title" i
     joined_raw["title_norm"] = joined_raw["title"].map(norm_title)
 if not joined_raw.empty and len(joined_raw) > SAMPLE_MAX:
     joined_raw = joined_raw.sample(SAMPLE_MAX, random_state=42)
-
-# ---------------- Plot-Helper ----------------
-def safe_hist(ax, data, *, bins=30, label=None, alpha=0.7, xlim=None, title=None, xlabel=None, ylabel=None):
-    """Histogram ohne numpy-Density-Warnungen; zeichnet nur, wenn Daten sinnvoll sind."""
-    s = pd.Series(data, dtype="float64").replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty or s.nunique(dropna=True) == 0:
-        ax.axis("off"); ax.text(0.5, 0.5, "Keine Daten", ha="center", va="center"); return
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ax.hist(s.values, bins=bins, alpha=alpha, label=label)  # density=False
-    if label: ax.legend()
-    if xlim: ax.set_xlim(*xlim)
-    if title: ax.set_title(title)
-    if xlabel: ax.set_xlabel(xlabel)
-    if ylabel: ax.set_ylabel(ylabel)
 
 # ---------------- UI ----------------
 app_ui = ui.page_sidebar(
@@ -125,10 +108,7 @@ app_ui = ui.page_sidebar(
         ui.output_ui("status_files"),
     ),
     ui.layout_column_wrap(
-        ui.card(
-            ui.card_header(ui.tags.div(id="page_title")),
-            ui.output_ui("page_body"),
-        ),
+        ui.card(ui.card_header(ui.tags.div(id="page_title")), ui.output_ui("page_body")),
         fill=False,
     ),
     title="Movie Ratings Dashboard",
@@ -138,7 +118,7 @@ app_ui = ui.page_sidebar(
 # ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # -------- Status ----------
+    # Status
     @output
     @render.ui
     def status_files():
@@ -150,7 +130,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ]
         return ui.tags.small(ui.tags.ul(*rows, style="margin:0;padding-left:18px;"))
 
-    # -------- Filter ----------
+    # Filter
     @reactive.Calc
     def df_joined():
         df = joined_raw.copy()
@@ -173,7 +153,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = df_joined()
         return d[d["rt_tomato"].isna()] if not d.empty and "rt_tomato" in d.columns else d
 
-    # -------- Titel ----------
+    # Titel
     @output
     @render.ui
     def page_title():
@@ -188,13 +168,13 @@ def server(input: Inputs, output: Outputs, session: Session):
         }
         return ui.tags.h3(mapping.get(input.page(),"Übersicht"))
 
-    # -------- Routing ----------
+    # Routing
     @output
     @render.ui
     def page_body():
         p = input.page()
-        if p == "overview":  return ui.div(kpi_ui(), ui.output_plot("p_avg_bars"), ui.output_plot("p_vote_hist"))
-        if p == "compare":   return ui.div(ui.output_plot("p_scatter_hex"), ui.output_plot("p_diff_hist"))
+        if p == "overview":  return ui.div(kpi_ui(), ui.output_plot("p_avg_bars"), ui.output_plot("p_vote_ecdf"))
+        if p == "compare":   return ui.div(ui.output_plot("p_scatter_hex"), ui.output_plot("p_diff_box"))
         if p == "coverage":  return ui.div(ui.output_plot("p_coverage_share"), ui.output_data_frame("tbl_missing_rt"))
         if p == "trends":    return ui.div(ui.output_plot("p_genre_avg"), ui.output_plot("p_decade_avg"))
         if p == "top20":     return ui.div(ui.output_plot("p_top20"), ui.output_data_frame("tbl_top20"))
@@ -202,7 +182,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if p == "table":     return ui.div(ui.output_data_frame("tbl_all"))
         return ui.div("—")
 
-    # -------- KPIs ----------
+    # KPIs
     def kpi_ui():
         d_all = df_joined()
         d_rt  = df_with_rt()
@@ -221,7 +201,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         cards.append(vb("RT-Abdeckung", f"{share:.1f}%"))
         return ui.layout_column_wrap(*cards, fill=False)
 
-    # -------- Übersicht --------
+    # Übersicht: Ø-Balken + ECDF (keine Histogramme)
     @output
     @render.plot
     def p_avg_bars():
@@ -242,16 +222,23 @@ def server(input: Inputs, output: Outputs, session: Session):
 
     @output
     @render.plot
-    def p_vote_hist():
+    def p_vote_ecdf():
         d = df_joined()
         fig,ax=plt.subplots(figsize=(9,3.8))
         if d.empty or "numVotes" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Stimmen-Daten",ha="center",va="center"); return fig
-        safe_hist(ax, np.log10(d["numVotes"].clip(lower=1)),
-                  bins=30, title="Verteilung der IMDb-Stimmen (log10)", xlabel="log10(Stimmen)")
+        x = np.log10(d["numVotes"].clip(lower=1)).dropna().to_numpy()
+        if x.size == 0:
+            ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
+        xs = np.sort(x)
+        ys = np.arange(1, xs.size+1) / xs.size
+        ax.plot(xs, ys)
+        ax.set_xlabel("log10(Stimmen)"); ax.set_ylabel("Anteil ≤ x")
+        ax.set_title("ECDF: Verteilung der IMDb-Stimmen")
+        ax.set_ylim(0,1)
         return fig
 
-    # -------- Vergleich --------
+    # Vergleich: Hexbin + Boxplot der Differenz
     @output
     @render.plot
     def p_scatter_hex():
@@ -273,18 +260,23 @@ def server(input: Inputs, output: Outputs, session: Session):
 
     @output
     @render.plot
-    def p_diff_hist():
+    def p_diff_box():
         d = df_with_rt().dropna(subset=["averageRating","rt_tomato"])
         fig,ax=plt.subplots(figsize=(9,3.8))
         if d.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
-        diff = d["rt_tomato"] - d["averageRating"]*10
-        safe_hist(ax, diff, bins=40, title="Differenz RT − IMDb(x10)",
-                  xlabel="Punkte", ylabel="Häufigkeit")
-        ax.axvline(0, color="k", linewidth=1)
+        data = [d["rt_tomato"] - d["averageRating"]*10]
+        labels = ["RT − IMDb(x10)"]
+        if "rt_audience" in d.columns and input.use_audience():
+            data.append(d["rt_audience"] - d["averageRating"]*10)
+            labels.append("Audience − IMDb(x10)")
+        ax.boxplot(data, showmeans=True, vert=True)
+        ax.set_xticklabels(labels, rotation=0)
+        ax.axhline(0, color="k", linewidth=1)
+        ax.set_ylabel("Punkte"); ax.set_title("Differenz zu IMDb (x10)")
         return fig
 
-    # -------- Abdeckung RT ----------
+    # Abdeckung RT
     @output
     @render.plot
     def p_coverage_share():
@@ -317,7 +309,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             if c not in d.columns: d[c]=pd.NA
         return d[cols].sort_values("Stimmen",ascending=False).head(200)
 
-    # -------- Trends ----------
+    # Trends
     @output
     @render.plot
     def p_genre_avg():
@@ -353,7 +345,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("Ø IMDb (x10) nach Jahrzehnt")
         return fig
 
-    # -------- Top 20 ----------
+    # Top 20
     @output
     @render.plot
     def p_top20():
@@ -382,7 +374,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             if c not in d.columns: d[c]=pd.NA
         return d[cols]
 
-    # -------- Google Trends ----------
+    # Google Trends
     @output
     @render.plot
     def p_gtrends():
@@ -405,7 +397,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = gtr_raw.copy()
         return d if not d.empty else pd.DataFrame(columns=["date","kw1","kw2","kw3","kw4","kw5"])
 
-    # -------- Tabelle (gefiltert) ----------
+    # Tabelle (gefiltert)
     @output
     @render.data_frame
     def tbl_all():
