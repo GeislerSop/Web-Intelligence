@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-# --- WARNINGS *VOR* numpy/matplotlib konfigurieren ----------------------------
+# --- WARNINGS *vor* numpy/matplotlib konfigurieren ----------------------------
 import os, warnings
 os.environ.setdefault("PYTHONWARNINGS", "ignore::RuntimeWarning")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-# (Optional präziser)
 warnings.filterwarnings(
     "ignore",
     category=RuntimeWarning,
@@ -55,7 +54,6 @@ def read_csv_local(path: Path | str) -> pd.DataFrame:
     """Robustes CSV-Laden (erkennt Komma/Semikolon automatisch)."""
     try:
         p = str(path)
-        # sep=None + engine="python" kann Trennzeichen sniffen
         df = pd.read_csv(p, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
         LOG.info(f"Loaded {p} → shape={df.shape}")
         return df
@@ -123,13 +121,14 @@ app_ui = ui.page_sidebar(
         ui.tags.hr(),
         ui.tags.div("Status", class_="muted"),
         ui.output_ui("status_files"),
+        open="open",   # <-- HIER initial offen (statt Dict!)
     ),
     ui.layout_column_wrap(
         ui.card(ui.card_header(ui.tags.div(id="page_title")), ui.output_ui("page_body")),
         fill=False,
     ),
     title="Movie Ratings Dashboard",
-    open={"desktop":"open","mobile":"closed"}
+    # KEIN open={"desktop":"open","mobile":"closed"} mehr!
 )
 
 # ---------------- Server ----------------
