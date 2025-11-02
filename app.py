@@ -1,31 +1,49 @@
-# app_shinylive.py — Movie Ratings (Shinylive, bundled CSVs)
-# • Läuft 100% im Browser (Pyodide) – kein Server, kein ETL
-# • Verwendet drei vorkonstruierte CSVs aus dem Ordner ./outputs/ :
-#     - joined_imdb_rt.csv         (Haupttabelle: IMDb × RottenTomatoes)
-#     - top20_by_votes_imdb.csv    (Top-20-Liste nach IMDb-Stimmen)
-#     - google_trends_top5.csv     (Zeitreihe für 3–5 Keywords)
-# • Sidebar-Fix: immer öffnbar, eigener Scrollbereich
+# app.py — Movie Ratings (Server-Shiny on Posit, portable for Shinylive)
+# Verwendet drei vorkonstruierte CSVs aus ./outputs/:
+#   - joined_imdb_rt.csv      (Haupttabelle: IMDb × RottenTomatoes)
+#   - top20_by_votes_imdb.csv (Top-20-Liste nach IMDb-Stimmen)
+#   - google_trends_top5.csv  (Zeitreihen von 3–5 Keywords)
 
 from __future__ import annotations
-import io, re
-import numpy as np, pandas as pd, matplotlib
+import io, re, os, sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import requests
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# Browser-Fetch via requests ermöglichen (Pyodide)
+# ------------------------------------------------------------
+# Portable CSV-Loader: Server liest von Platte, Shinylive via HTTP
+# ------------------------------------------------------------
+IN_BROWSER = ("__pyodide__" in sys.modules) or os.environ.get("PYODIDE") == "1"
 try:
+    # Für Shinylive (Browser): requests → fetch
     import pyodide_http  # type: ignore
-    pyodide_http.patch_all()
+    if IN_BROWSER:
+        pyodide_http.patch_all()
 except Exception:
     pass
 
+BASE_DIR = Path(__file__).resolve().parent
+CSV_JOINED = BASE_DIR / "outputs" / "joined_imdb_rt.csv"
+CSV_TOP20  = BASE_DIR / "outputs" / "top20_by_votes_imdb.csv"
+CSV_GT     = BASE_DIR / "outputs" / "google_trends_top5.csv"
+
+def read_csv_portable(path: Path | str) -> pd.DataFrame:
+    """Shinylive: HTTP-fetch; Server: direkt von Platte."""
+    if IN_BROWSER:
+        url = path.as_posix() if isinstance(path, Path) else str(path)
+        r = requests.get(url, timeout=45); r.raise_for_status()
+        return pd.read_csv(io.BytesIO(r.content))
+    else:
+        p = str(path) if isinstance(path, str) else str(path)
+        return pd.read_csv(p)
+
 # ---------------- Config ----------------
-CSV_JOINED = "outputs/joined_imdb_rt.csv"
-CSV_TOP20  = "outputs/top20_by_votes_imdb.csv"
-CSV_GT     = "outputs/google_trends_top5.csv"
-SAMPLE_MAX = 80000  # weiches Limit für Interaktivität
+SAMPLE_MAX = 80_000  # weiches Limit für Interaktivität
 
 # ---------------- Helpers ----------------
 def norm_title(t: str) -> str:
@@ -34,29 +52,24 @@ def norm_title(t: str) -> str:
     t = re.sub(r"[^a-z0-9 ]+", " ", str(t).lower())
     return " ".join(t.split())
 
-def _safe_read_csv(path: str) -> pd.DataFrame:
-    """Liest eine gebündelte CSV (aus demselben Build). Gibt leeres DF bei Fehler."""
-    try:
-        r = requests.get(path, timeout=45)
-        r.raise_for_status()
-        return pd.read_csv(io.BytesIO(r.content))
-    except Exception:
-        return pd.DataFrame()
-
 # ---------------- UI ----------------
 app_ui = ui.page_sidebar(
     ui.sidebar(
-        # —— Styling & Sidebar-Scroll-Fix ——
+        # Styling + Sidebar-Scroll-Fix (immer öffnbar, eigener Scrollbereich)
         ui.tags.style(
             """
             :root{--bg:#f7f8fb;--card:#ffffff;--muted:#6b7280;--line:#e8ebf3;--brand:#2563eb;--brand-weak:#e8efff}
             html,body{height:100%;background:var(--bg);color:#0f172a}
-            .sidebar{background:var(--card);border-right:1px solid var(--line);
-                     height:100vh;max-height:100vh;overflow:auto;position:sticky;top:0}
+            .sidebar{
+              background:var(--card);border-right:1px solid var(--line);
+              height:100vh;max-height:100vh;overflow:auto;position:sticky;top:0
+            }
             .card{background:var(--card);border:1px solid var(--line);border-radius:14px;box-shadow:0 8px 18px rgba(16,24,40,.06)}
             .btn{background:var(--brand);color:#fff;border-radius:10px;border:none}
             .muted{color:var(--muted);font-size:12px}
-            .side-nav .shiny-input-radiogroup>div>label{display:block;padding:9px 12px;margin:4px 0;border-radius:10px;border:1px solid var(--line);cursor:pointer}
+            .side-nav .shiny-input-radiogroup>div>label{
+              display:block;padding:9px 12px;margin:4px 0;border-radius:10px;border:1px solid var(--line);cursor:pointer
+            }
             .side-nav input[type=radio]{display:none}
             .side-nav .shiny-input-radiogroup>div>label:hover{background:#fafcff}
             .side-nav .shiny-input-radiogroup>div>input:checked+label{background:var(--brand-weak);border-color:#c7d7ff}
@@ -73,11 +86,11 @@ app_ui = ui.page_sidebar(
                 None,
                 choices={
                     "overview": "Überblick",
-                    "compare": "IMDb ↔ RT",
-                    "trends": "Genres/Jahrzehnte",
-                    "top20": "Top 20 (IMDb)",
-                    "gtrends": "Google Trends",
-                    "table": "Tabelle",
+                    "compare":  "IMDb ↔ RT",
+                    "trends":   "Genres/Jahrzehnte",
+                    "top20":    "Top 20 (IMDb)",
+                    "gtrends":  "Google Trends",
+                    "table":    "Tabelle",
                 },
                 selected="overview",
                 inline=False,
@@ -87,8 +100,8 @@ app_ui = ui.page_sidebar(
         ui.tags.hr(),
         ui.tags.div("Filter", class_="muted", style="margin-bottom:6px;"),
         ui.input_numeric("year_start", "Jahr von", 1980, min=1920, max=2025, step=1),
-        ui.input_numeric("year_end", "Jahr bis", 2025, min=1920, max=2025, step=1),
-        ui.input_numeric("min_votes", "Min. IMDb-Stimmen", value=50000, min=0, step=1000),
+        ui.input_numeric("year_end",   "Jahr bis",  2025, min=1920, max=2025, step=1),
+        ui.input_numeric("min_votes",  "Min. IMDb-Stimmen", value=50000, min=0, step=1000),
         ui.input_checkbox("use_audience", "Audience-Score zusätzlich", False),
     ),
     ui.layout_column_wrap(
@@ -98,7 +111,7 @@ app_ui = ui.page_sidebar(
         ),
         fill=False,
     ),
-    title="Movie Ratings (Shinylive)",
+    title="Movie Ratings",
     open={"desktop": "open", "mobile": "closed"},
 )
 
@@ -107,15 +120,16 @@ def server(input: Inputs, output: Outputs, session: Session):
     store = reactive.Value({
         "ready": False,
         "joined": pd.DataFrame(),  # Hauptdaten
-        "top20": pd.DataFrame(),   # Top-20 IMDb
-        "gtr": pd.DataFrame(),     # Google Trends Zeitreihen
-        "error": "",
-        "src": "./outputs",
+        "top20":  pd.DataFrame(),  # Top-20 IMDb
+        "gtr":    pd.DataFrame(),  # Google Trends
+        "error":  "",
+        "src":    "./outputs",
     })
     _boot_done = reactive.Value(False)
 
     def set_error(msg: str):
-        s = store.get().copy(); s.update({"ready": False, "error": msg})
+        s = store.get().copy()
+        s.update({"ready": False, "error": msg})
         store.set(s)
         ui.notification_show(msg, type="warning", duration=6)
 
@@ -127,13 +141,14 @@ def server(input: Inputs, output: Outputs, session: Session):
         _boot_done.set(True)
         ui.notification_show("Lade CSVs …", duration=None, id="note")
         try:
-            joined = _safe_read_csv(CSV_JOINED)
-            top20  = _safe_read_csv(CSV_TOP20)
-            gtr    = _safe_read_csv(CSV_GT)
+            joined = read_csv_portable(CSV_JOINED)
+            top20  = read_csv_portable(CSV_TOP20)
+            gtr    = read_csv_portable(CSV_GT)
 
             need = {"title", "year", "averageRating", "numVotes"}
             if joined.empty or not need.issubset(set(joined.columns)):
-                raise RuntimeError("joined_imdb_rt.csv fehlt oder hat nicht die Mindestspalten")
+                raise RuntimeError("joined_imdb_rt.csv fehlt oder Mindestspalten fehlen")
+
             if "title_norm" not in joined.columns:
                 joined["title_norm"] = joined["title"].map(norm_title)
             if len(joined) > SAMPLE_MAX:
@@ -142,10 +157,10 @@ def server(input: Inputs, output: Outputs, session: Session):
             store.set({
                 "ready": True,
                 "joined": joined,
-                "top20": top20 if not top20.empty else pd.DataFrame(),
-                "gtr": gtr if not gtr.empty else pd.DataFrame(),
-                "error": "",
-                "src": "./outputs",
+                "top20":  top20 if not top20.empty else pd.DataFrame(),
+                "gtr":    gtr if not gtr.empty else pd.DataFrame(),
+                "error":  "",
+                "src":    "./outputs",
             })
             ui.notification_show("CSVs geladen.", type="message", duration=3)
         except Exception as e:
@@ -153,7 +168,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         finally:
             ui.notification_remove("note")
 
-    # Filter beziehen sich auf die Haupttabelle (joined)
+    # Filter auf Haupttabelle
     @reactive.Calc
     def df_filtered():
         s = store.get()
@@ -175,26 +190,28 @@ def server(input: Inputs, output: Outputs, session: Session):
         s = store.get()
         mapping = {
             "overview": "Überblick",
-            "compare": "IMDb ↔ Rotten Tomatoes",
-            "trends": "Genres & Jahrzehnte",
-            "top20": "Top 20 (IMDb)",
-            "gtrends": "Google Trends",
-            "table": "Tabelle",
+            "compare":  "IMDb ↔ Rotten Tomatoes",
+            "trends":   "Genres & Jahrzehnte",
+            "top20":    "Top 20 (IMDb)",
+            "gtrends":  "Google Trends",
+            "table":    "Tabelle",
         }
         title = mapping.get(input.page(), "Überblick")
         return ui.tags.h3(f"{title} — Quelle: {s['src']}")
 
-    # Routen-Inhalt
+    # Seiteninhalt
     @output
     @render.ui
     def page_body():
         s = store.get()
         if not s["ready"]:
             return ui.div(
-                ui.tags.div("Noch keine Daten. CSVs werden automatisch geladen …", class_="muted", style="margin-bottom:8px;"),
+                ui.tags.div("Noch keine Daten. CSVs werden automatisch geladen …",
+                            class_="muted", style="margin-bottom:8px;"),
                 ui.tags.progress(max="100", value="25"),
             )
-        warn = ui.tags.div(f"Hinweis: {s['error']}", class_="muted", style="margin-bottom:10px;") if s["error"] else ui.tags.div()
+        warn = ui.tags.div(f"Hinweis: {s['error']}", class_="muted",
+                           style="margin-bottom:10px;") if s["error"] else ui.tags.div()
         p = input.page()
         if p == "overview":
             return ui.div(warn, kpi_ui(df_filtered()), ui.output_plot("p_avg"))
@@ -210,10 +227,10 @@ def server(input: Inputs, output: Outputs, session: Session):
             return ui.div(warn, ui.output_data_frame("tbl"))
         return ui.div("—")
 
-    # KPIs (aus Filter)
+    # KPIs
     def kpi_ui(df: pd.DataFrame):
         imdb_mean = (df["averageRating"].dropna().mean() * 10) if "averageRating" in df.columns and df["averageRating"].notna().any() else np.nan
-        rt_mean = df["rt_tomato"].dropna().mean() if "rt_tomato" in df.columns and df["rt_tomato"].notna().any() else np.nan
+        rt_mean   = df["rt_tomato"].dropna().mean() if "rt_tomato" in df.columns and df["rt_tomato"].notna().any() else np.nan
         return ui.layout_column_wrap(
             ui.value_box(title="Filme (gefiltert)", value=f"{len(df)}"),
             ui.value_box(title="Ø IMDb (x10)", value=("—" if pd.isna(imdb_mean) else f"{imdb_mean:.1f}")),
@@ -221,7 +238,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             fill=False,
         )
 
-    # —— Plots auf Basis der Haupttabelle ——
+    # —— Plots (Hauptdaten) ——
     @output
     @render.plot
     def p_avg():
@@ -306,8 +323,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig, ax = plt.subplots(figsize=(9, 5))
         if df.empty:
             ax.axis("off"); ax.text(0.5, 0.5, "Keine Top-20-Daten", ha="center", va="center"); return fig
-        # Erwartete Spalten: tconst,title,year,averageRating,numVotes
-        d = df.copy().sort_values("numVotes", ascending=True).tail(20)
+        d = df.copy().sort_values("numVotes", ascending=True).tail(20)  # 20 größte
         labels = d["title"].astype(str) + " (" + d["year"].astype(str) + ")"
         ax.barh(labels, d["numVotes"].values)
         ax.set_xlabel("Stimmen (IMDb)"); ax.set_title("Top 20 nach Stimmen (IMDb)")
@@ -335,7 +351,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig, ax = plt.subplots(figsize=(9, 4))
         if d.empty:
             ax.axis("off"); ax.text(0.5, 0.5, "Keine Trends-Daten", ha="center", va="center"); return fig
-        # Erwartet: erste Spalte Datum/Index, rest Keywords
         if "date" in d.columns:
             d = d.set_index("date")
         else:
@@ -357,15 +372,14 @@ def server(input: Inputs, output: Outputs, session: Session):
     def tbl():
         df = df_filtered().copy()
         if df.empty:
-            return pd.DataFrame(columns=["Titel", "Jahr", "IMDb (x10)", "RT Tomatometer", "RT Audience", "Stimmen", "genres", "tconst"])
+            return pd.DataFrame(columns=["Titel","Jahr","IMDb (x10)","RT Tomatometer","RT Audience","Stimmen","genres","tconst"])
         df["IMDb (x10)"] = (df["averageRating"] * 10).round(1)
         df["RT Tomatometer"] = df.get("rt_tomato", pd.Series(index=df.index)).round(1)
-        df["RT Audience"] = df.get("rt_audience", pd.Series(index=df.index)).round(1)
-        df = df.rename(columns={"title": "Titel", "year": "Jahr", "numVotes": "Stimmen"})
-        cols = ["Titel", "Jahr", "IMDb (x10)", "RT Tomatometer", "RT Audience", "Stimmen", "genres", "tconst"]
+        df["RT Audience"]    = df.get("rt_audience", pd.Series(index=df.index)).round(1)
+        df = df.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
+        cols = ["Titel","Jahr","IMDb (x10)","RT Tomatometer","RT Audience","Stimmen","genres","tconst"]
         for c in cols:
-            if c not in df.columns:
-                df[c] = pd.NA
+            if c not in df.columns: df[c] = pd.NA
         return df[cols].sort_values("Stimmen", ascending=False)
 
 app = App(app_ui, server)
