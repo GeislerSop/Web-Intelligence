@@ -1,35 +1,32 @@
-# app.py — Movie Ratings Dashboard (Posit Connect, ohne Histogramme + Warning-Fix)
+# app.py — Movie Ratings Dashboard (Posit Connect, mehrere Seiten, ohne Histogramme)
 # nutzt 3 CSVs aus ./outputs:
 #   joined_imdb_rt.csv | top20_by_votes_imdb.csv | google_trends_top5.csv
-# app.py – Header-Patch: Warnings & NumPy-Errors global unterdrücken (muss GANZ oben stehen!)
-import warnings, os
-# falls Connect das env respektiert:
-os.environ.setdefault("PYTHONWARNINGS", "ignore::RuntimeWarning")
-# Python-Warnings unterdrücken (bevor numpy/matplotlib geladen werden)
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-# jetzt erst NumPy/Matplotlib laden und NumPy-Fehlerzustand dämpfen
-import numpy as np
-np.seterr(all="ignore")  # auch divide/invalid etc. global ignorieren
 
 from __future__ import annotations
-import re, logging, warnings
+
+# --- WARNINGS *VOR* numpy/matplotlib konfigurieren ----------------------------
+import os, warnings
+os.environ.setdefault("PYTHONWARNINGS", "ignore::RuntimeWarning")
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+# (Optional präziser)
+warnings.filterwarnings(
+    "ignore",
+    category=RuntimeWarning,
+    module=r"numpy(\.lib)?\._histograms_impl"
+)
+
+# --- Standard-Imports ---------------------------------------------------------
+import re, logging
 from pathlib import Path
+
 import numpy as np
+np.seterr(all="ignore")  # divide/invalid/etc. global ignorieren
+
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
-
-# --- gezieltes Silencing für fremde Aufrufer von numpy.histogram(density=True)
-np.seterr(divide="ignore", invalid="ignore")
-warnings.filterwarnings(
-    "ignore",
-    category=RuntimeWarning,
-    message="invalid value encountered in divide",
-    module=r"numpy\.lib\._histograms_impl"
-)
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -55,10 +52,11 @@ CSV_TOP20  = _find("top20")
 CSV_GT     = _find("gtr")
 
 def read_csv_local(path: Path | str) -> pd.DataFrame:
+    """Robustes CSV-Laden (erkennt Komma/Semikolon automatisch)."""
     try:
-        p = str(path) if isinstance(path, str) else str(path)
-        # ggf. sep=";" / encoding="utf-8-sig" anpassen
-        df = pd.read_csv(p)
+        p = str(path)
+        # sep=None + engine="python" kann Trennzeichen sniffen
+        df = pd.read_csv(p, sep=None, engine="python", encoding="utf-8", on_bad_lines="skip")
         LOG.info(f"Loaded {p} → shape={df.shape}")
         return df
     except Exception as e:
@@ -153,8 +151,7 @@ def server(input: Inputs, output: Outputs, session: Session):
     @reactive.Calc
     def df_joined():
         df = joined_raw.copy()
-        if df.empty:
-            return df
+        if df.empty: return df
         y1, y2 = int(input.year_start()), int(input.year_end())
         if y1 > y2: y1, y2 = y2, y1
         mv = int(input.min_votes())
