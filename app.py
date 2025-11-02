@@ -3,7 +3,7 @@
 #   joined_imdb_rt.csv | top20_by_votes_imdb.csv | google_trends_top5.csv
 
 from __future__ import annotations
-import os, sys, re, logging
+import re, logging
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -24,7 +24,6 @@ FILES = {
     "top20":  "top20_by_votes_imdb.csv",
     "gtr":    "google_trends_top5.csv",
 }
-
 def _find(key: str) -> Path:
     fname = FILES[key]
     for root in CANDIDATES:
@@ -42,7 +41,7 @@ CSV_GT     = _find("gtr")
 def read_csv_local(path: Path | str) -> pd.DataFrame:
     try:
         p = str(path) if isinstance(path, str) else str(path)
-        # falls Deine CSVs Semikolon-getrennt sind: sep=";"
+        # falls Semikolon: pd.read_csv(p, sep=";")
         df = pd.read_csv(p)
         LOG.info(f"Loaded {p} → shape={df.shape}")
         return df
@@ -67,16 +66,14 @@ if not joined_raw.empty and "title_norm" not in joined_raw.columns and "title" i
 if not joined_raw.empty and len(joined_raw) > SAMPLE_MAX:
     joined_raw = joined_raw.sample(SAMPLE_MAX, random_state=42)
 
-# ---------------- kleine Plot-Helper ----------------
-def safe_hist(ax, data, *, bins=30, label=None, alpha=0.7, density=False, xlim=None, title=None, xlabel=None, ylabel=None):
-    """Histogram ohne RuntimeWarning, wenn Daten leer/konstant sind."""
-    s = pd.Series(data).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty:
-        ax.axis("off"); ax.text(0.5, 0.5, "Keine Daten", ha="center", va="center")
-        return
-    # density nur, wenn Summe > 0
-    use_density = bool(density) and (s.size > 0) and (s.sum() != 0)
-    ax.hist(s.values, bins=bins, alpha=alpha, label=label, density=use_density)
+# ---------------- Plot-Helper ----------------
+def safe_hist(ax, data, *, bins=30, label=None, alpha=0.7, xlim=None, title=None, xlabel=None, ylabel=None):
+    """Histogram ohne numpy-Density-Warnungen; zeichnet nur, wenn Daten sinnvoll sind."""
+    s = pd.Series(data, dtype="float64").replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty or s.nunique(dropna=True) == 0:
+        ax.axis("off"); ax.text(0.5, 0.5, "Keine Daten", ha="center", va="center"); return
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ax.hist(s.values, bins=bins, alpha=alpha, label=label)  # density=False
     if label: ax.legend()
     if xlim: ax.set_xlim(*xlim)
     if title: ax.set_title(title)
@@ -224,7 +221,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         cards.append(vb("RT-Abdeckung", f"{share:.1f}%"))
         return ui.layout_column_wrap(*cards, fill=False)
 
-    # -------- Übersicht: Ø-Balken + Stimmen-Hist --------
+    # -------- Übersicht --------
     @output
     @render.plot
     def p_avg_bars():
@@ -250,11 +247,11 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig,ax=plt.subplots(figsize=(9,3.8))
         if d.empty or "numVotes" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Stimmen-Daten",ha="center",va="center"); return fig
-        safe_hist(ax, np.log10(d["numVotes"].clip(lower=1)), bins=30,
-                  title="Verteilung der IMDb-Stimmen (log10)", xlabel="log10(Stimmen)")
+        safe_hist(ax, np.log10(d["numVotes"].clip(lower=1)),
+                  bins=30, title="Verteilung der IMDb-Stimmen (log10)", xlabel="log10(Stimmen)")
         return fig
 
-    # -------- Vergleich: Hexbin + Differenz-Hist --------
+    # -------- Vergleich --------
     @output
     @render.plot
     def p_scatter_hex():
@@ -266,12 +263,9 @@ def server(input: Inputs, output: Outputs, session: Session):
         hb = ax.hexbin(x, y, gridsize=30, extent=[0,100,0,100], linewidths=0.2)
         ax.set_xlim(0,100); ax.set_ylim(0,100)
         ax.set_xlabel("IMDb (x10)"); ax.set_ylabel("RT Tomatometer")
-        # Regression + r
         if len(x) >= 2:
-            m,b = np.polyfit(x, y, 1)
-            xs = np.linspace(0,100,200); ax.plot(xs, m*xs + b)
-            r = np.corrcoef(x, y)[0,1]
-            ax.set_title(f"IMDb vs RT — Regr. y={m:.2f}x+{b:.1f},  r={r:.2f}")
+            m,b = np.polyfit(x, y, 1); xs = np.linspace(0,100,200); ax.plot(xs, m*xs + b)
+            r = np.corrcoef(x, y)[0,1]; ax.set_title(f"IMDb vs RT — Regr. y={m:.2f}x+{b:.1f}, r={r:.2f}")
         else:
             ax.set_title("IMDb vs RT")
         fig.colorbar(hb, ax=ax, label="Dichte")
@@ -285,7 +279,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if d.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
         diff = d["rt_tomato"] - d["averageRating"]*10
-        safe_hist(ax, diff, bins=40, density=False, title="Differenz RT − IMDb(x10)",
+        safe_hist(ax, diff, bins=40, title="Differenz RT − IMDb(x10)",
                   xlabel="Punkte", ylabel="Häufigkeit")
         ax.axvline(0, color="k", linewidth=1)
         return fig
@@ -300,7 +294,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
         tmp = d.dropna(subset=["year"]).copy()
         tmp["has_rt"] = tmp["rt_tomato"].notna() if "rt_tomato" in tmp.columns else False
-        if tmp.empty or "has_rt" not in tmp:
+        if tmp.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine RT-Infos",ha="center",va="center"); return fig
         share = (tmp.groupby("year")["has_rt"].mean()*100).sort_index()
         if share.empty:
@@ -316,11 +310,11 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = df_without_rt().copy()
         if d.empty:
             return pd.DataFrame(columns=["Titel","Jahr","IMDb (x10)","Stimmen","genres","tconst"])
-        d["IMDb (x10)"] = (d["averageRating"]*10).round(1) if "averageRating" in d.columns else pd.NA
+        if "averageRating" in d: d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
         d = d.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
         cols = ["Titel","Jahr","IMDb (x10)","Stimmen","genres","tconst"]
         for c in cols:
-            if c not in d.columns: d[c] = pd.NA
+            if c not in d.columns: d[c]=pd.NA
         return d[cols].sort_values("Stimmen",ascending=False).head(200)
 
     # -------- Trends ----------
@@ -350,10 +344,10 @@ def server(input: Inputs, output: Outputs, session: Session):
         if d.empty or "year" not in d or "averageRating" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Jahresdaten",ha="center",va="center"); return fig
         dec = d.dropna(subset=["year"]).copy()
-        if dec.empty:
-            ax.axis("off"); ax.text(0.5,0.5,"Keine Jahresdaten",ha="center",va="center"); return fig
         dec["decade"] = (dec["year"].astype(int)//10)*10
         avg=(dec.groupby("decade")["averageRating"].mean().sort_index())*10
+        if avg.empty:
+            ax.axis("off"); ax.text(0.5,0.5,"Keine Jahresdaten",ha="center",va="center"); return fig
         ax.plot(avg.index, avg.values, marker="o"); ax.set_ylim(0,100)
         ax.set_xlabel("Jahrzehnt"); ax.set_ylabel("Ø (0–100)")
         ax.set_title("Ø IMDb (x10) nach Jahrzehnt")
@@ -365,7 +359,8 @@ def server(input: Inputs, output: Outputs, session: Session):
     def p_top20():
         d = top20_raw.copy()
         fig,ax=plt.subplots(figsize=(9,5))
-        if d.empty or "numVotes" not in d or "title" not in d or "year" not in d:
+        need = {"title","year","numVotes"}
+        if d.empty or not need.issubset(d.columns):
             ax.axis("off"); ax.text(0.5,0.5,"Keine Top-20-Daten",ha="center",va="center"); return fig
         d = d.sort_values("numVotes", ascending=True).tail(20)
         labels = d["title"].astype(str) + " (" + d["year"].astype(str) + ")"
@@ -380,8 +375,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if d.empty:
             return pd.DataFrame(columns=["Titel","Jahr","IMDb (x10)","Stimmen","tconst"])
         d = d.sort_values("numVotes", ascending=False).head(20)
-        if "averageRating" in d:
-            d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
+        if "averageRating" in d: d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
         d = d.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
         cols=["Titel","Jahr","IMDb (x10)","Stimmen","tconst"]
         for c in cols:
