@@ -1,13 +1,9 @@
 # app.py — Movie Ratings Dashboard (Posit Connect)
-# Nutzt 3 CSVs aus ./outputs:
-#   - joined_imdb_rt.csv      (IMDb × RottenTomatoes, Hauptdaten)
-#   - top20_by_votes_imdb.csv (Top-20 nach IMDb-Stimmen)
-#   - google_trends_top5.csv  (Zeitreihen)
-# Seiten:
-#   Übersicht | Vergleich (IMDb↔RT) | Abdeckung RT | Trends | Top 20 | Google Trends | Tabelle
+# nutzt 3 CSVs aus ./outputs:
+#   joined_imdb_rt.csv | top20_by_votes_imdb.csv | google_trends_top5.csv
 
 from __future__ import annotations
-import io, os, re, sys, logging
+import os, sys, re, logging
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -16,7 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# ---------------- Logging (Posit-Logs) ----------------
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 LOG = logging.getLogger("movie-app")
 
@@ -25,18 +21,18 @@ BASE_DIR = Path(__file__).resolve().parent
 CANDIDATES = [BASE_DIR / "outputs", Path.cwd() / "outputs", BASE_DIR]
 FILES = {
     "joined": "joined_imdb_rt.csv",
-    "top20": "top20_by_votes_imdb.csv",
-    "gtr":   "google_trends_top5.csv",
+    "top20":  "top20_by_votes_imdb.csv",
+    "gtr":    "google_trends_top5.csv",
 }
 
-def _find(name_key: str) -> Path:
-    fname = FILES[name_key]
+def _find(key: str) -> Path:
+    fname = FILES[key]
     for root in CANDIDATES:
         p = root / fname
         if p.exists():
-            LOG.info(f"Found {name_key}: {p}")
+            LOG.info(f"Found {key}: {p}")
             return p
-    LOG.warning(f"{name_key} not found; expect relative path outputs/{fname}")
+    LOG.warning(f"{key} not found in {CANDIDATES}; fallback to outputs/{fname}")
     return Path("outputs") / fname
 
 CSV_JOINED = _find("joined")
@@ -46,7 +42,8 @@ CSV_GT     = _find("gtr")
 def read_csv_local(path: Path | str) -> pd.DataFrame:
     try:
         p = str(path) if isinstance(path, str) else str(path)
-        df = pd.read_csv(p)  # ggf. sep=';' oder encoding='utf-8-sig' hier setzen
+        # falls Deine CSVs Semikolon-getrennt sind: sep=";"
+        df = pd.read_csv(p)
         LOG.info(f"Loaded {p} → shape={df.shape}")
         return df
     except Exception as e:
@@ -65,11 +62,26 @@ def norm_title(t: str) -> str:
     t = re.sub(r"[^a-z0-9 ]+"," ", str(t).lower())
     return " ".join(t.split())
 
-# vorbereiten
 if not joined_raw.empty and "title_norm" not in joined_raw.columns and "title" in joined_raw.columns:
     joined_raw["title_norm"] = joined_raw["title"].map(norm_title)
 if not joined_raw.empty and len(joined_raw) > SAMPLE_MAX:
     joined_raw = joined_raw.sample(SAMPLE_MAX, random_state=42)
+
+# ---------------- kleine Plot-Helper ----------------
+def safe_hist(ax, data, *, bins=30, label=None, alpha=0.7, density=False, xlim=None, title=None, xlabel=None, ylabel=None):
+    """Histogram ohne RuntimeWarning, wenn Daten leer/konstant sind."""
+    s = pd.Series(data).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        ax.axis("off"); ax.text(0.5, 0.5, "Keine Daten", ha="center", va="center")
+        return
+    # density nur, wenn Summe > 0
+    use_density = bool(density) and (s.size > 0) and (s.sum() != 0)
+    ax.hist(s.values, bins=bins, alpha=alpha, label=label, density=use_density)
+    if label: ax.legend()
+    if xlim: ax.set_xlim(*xlim)
+    if title: ax.set_title(title)
+    if xlabel: ax.set_xlabel(xlabel)
+    if ylabel: ax.set_ylabel(ylabel)
 
 # ---------------- UI ----------------
 app_ui = ui.page_sidebar(
@@ -129,7 +141,7 @@ app_ui = ui.page_sidebar(
 # ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # ---------- Status ----------
+    # -------- Status ----------
     @output
     @render.ui
     def status_files():
@@ -141,7 +153,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ]
         return ui.tags.small(ui.tags.ul(*rows, style="margin:0;padding-left:18px;"))
 
-    # ---------- gefilterte DFs ----------
+    # -------- Filter ----------
     @reactive.Calc
     def df_joined():
         df = joined_raw.copy()
@@ -156,17 +168,15 @@ def server(input: Inputs, output: Outputs, session: Session):
 
     @reactive.Calc
     def df_with_rt():
-        df = df_joined()
-        if df.empty: return df
-        return df[df["rt_tomato"].notna()]  # „mit RT“
+        d = df_joined()
+        return d[d["rt_tomato"].notna()] if not d.empty and "rt_tomato" in d.columns else d.iloc[0:0]
 
     @reactive.Calc
     def df_without_rt():
-        df = df_joined()
-        if df.empty: return df
-        return df[df["rt_tomato"].isna()]   # „ohne RT“
+        d = df_joined()
+        return d[d["rt_tomato"].isna()] if not d.empty and "rt_tomato" in d.columns else d
 
-    # ---------- Titel ----------
+    # -------- Titel ----------
     @output
     @render.ui
     def page_title():
@@ -174,14 +184,14 @@ def server(input: Inputs, output: Outputs, session: Session):
             "overview":"Übersicht",
             "compare":"Vergleich IMDb ↔ Rotten Tomatoes",
             "coverage":"Abdeckung Rotten Tomatoes",
-            "trends":"Trends (Genre & Jahrzehnte)",
+            "trends":"Trends (Genre & Jahrzehnt)",
             "top20":"Top 20 (IMDb-Stimmen)",
             "gtrends":"Google Trends",
             "table":"Tabelle (gefiltert)",
         }
         return ui.tags.h3(mapping.get(input.page(),"Übersicht"))
 
-    # ---------- Routing ----------
+    # -------- Routing ----------
     @output
     @render.ui
     def page_body():
@@ -195,7 +205,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if p == "table":     return ui.div(ui.output_data_frame("tbl_all"))
         return ui.div("—")
 
-    # ---------- KPIs ----------
+    # -------- KPIs ----------
     def kpi_ui():
         d_all = df_joined()
         d_rt  = df_with_rt()
@@ -207,14 +217,14 @@ def server(input: Inputs, output: Outputs, session: Session):
         if not d_rt.empty:
             rt_mean = d_rt["rt_tomato"].dropna().mean()
             cards.append(vb("Ø RT Tomatometer", f"{rt_mean:.1f}"))
-            if input.use_audience():
-                aud_mean = d_rt["rt_audience"].dropna().mean() if "rt_audience" in d_rt else np.nan
+            if input.use_audience() and "rt_audience" in d_rt:
+                aud_mean = d_rt["rt_audience"].dropna().mean()
                 cards.append(vb("Ø RT Audience", "—" if pd.isna(aud_mean) else f"{aud_mean:.1f}"))
         share = (len(d_rt)/len(d_all)*100) if len(d_all)>0 else 0
         cards.append(vb("RT-Abdeckung", f"{share:.1f}%"))
         return ui.layout_column_wrap(*cards, fill=False)
 
-    # ---------- PLOTS (Übersicht) ----------
+    # -------- Übersicht: Ø-Balken + Stimmen-Hist --------
     @output
     @render.plot
     def p_avg_bars():
@@ -240,11 +250,11 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig,ax=plt.subplots(figsize=(9,3.8))
         if d.empty or "numVotes" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Stimmen-Daten",ha="center",va="center"); return fig
-        ax.hist(np.log10(d["numVotes"].clip(lower=1)), bins=30, alpha=.7)
-        ax.set_xlabel("log10(IMDb-Stimmen)"); ax.set_title("Verteilung der Stimmen (log-Skala)")
+        safe_hist(ax, np.log10(d["numVotes"].clip(lower=1)), bins=30,
+                  title="Verteilung der IMDb-Stimmen (log10)", xlabel="log10(Stimmen)")
         return fig
 
-    # ---------- PLOTS (Vergleich IMDb ↔ RT) ----------
+    # -------- Vergleich: Hexbin + Differenz-Hist --------
     @output
     @render.plot
     def p_scatter_hex():
@@ -257,10 +267,13 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_xlim(0,100); ax.set_ylim(0,100)
         ax.set_xlabel("IMDb (x10)"); ax.set_ylabel("RT Tomatometer")
         # Regression + r
-        m,b = np.polyfit(x, y, 1)
-        xs = np.linspace(0,100,200); ax.plot(xs, m*xs + b)
-        r = np.corrcoef(x, y)[0,1]
-        ax.set_title(f"IMDb vs RT — Regr. y={m:.2f}x+{b:.1f},  r={r:.2f}")
+        if len(x) >= 2:
+            m,b = np.polyfit(x, y, 1)
+            xs = np.linspace(0,100,200); ax.plot(xs, m*xs + b)
+            r = np.corrcoef(x, y)[0,1]
+            ax.set_title(f"IMDb vs RT — Regr. y={m:.2f}x+{b:.1f},  r={r:.2f}")
+        else:
+            ax.set_title("IMDb vs RT")
         fig.colorbar(hb, ax=ax, label="Dichte")
         return fig
 
@@ -272,12 +285,12 @@ def server(input: Inputs, output: Outputs, session: Session):
         if d.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
         diff = d["rt_tomato"] - d["averageRating"]*10
-        ax.hist(diff, bins=40, alpha=.8)
+        safe_hist(ax, diff, bins=40, density=False, title="Differenz RT − IMDb(x10)",
+                  xlabel="Punkte", ylabel="Häufigkeit")
         ax.axvline(0, color="k", linewidth=1)
-        ax.set_title("Differenz RT − IMDb(x10)"); ax.set_xlabel("Punkte"); ax.set_ylabel("Dichte")
         return fig
 
-    # ---------- Abdeckung RT ----------
+    # -------- Abdeckung RT ----------
     @output
     @render.plot
     def p_coverage_share():
@@ -286,7 +299,9 @@ def server(input: Inputs, output: Outputs, session: Session):
         if d.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
         tmp = d.dropna(subset=["year"]).copy()
-        tmp["has_rt"] = tmp["rt_tomato"].notna()
+        tmp["has_rt"] = tmp["rt_tomato"].notna() if "rt_tomato" in tmp.columns else False
+        if tmp.empty or "has_rt" not in tmp:
+            ax.axis("off"); ax.text(0.5,0.5,"Keine RT-Infos",ha="center",va="center"); return fig
         share = (tmp.groupby("year")["has_rt"].mean()*100).sort_index()
         if share.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Jahresdaten",ha="center",va="center"); return fig
@@ -301,20 +316,20 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = df_without_rt().copy()
         if d.empty:
             return pd.DataFrame(columns=["Titel","Jahr","IMDb (x10)","Stimmen","genres","tconst"])
-        d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
+        d["IMDb (x10)"] = (d["averageRating"]*10).round(1) if "averageRating" in d.columns else pd.NA
         d = d.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
         cols = ["Titel","Jahr","IMDb (x10)","Stimmen","genres","tconst"]
         for c in cols:
-            if c not in d.columns: d[c]=pd.NA
+            if c not in d.columns: d[c] = pd.NA
         return d[cols].sort_values("Stimmen",ascending=False).head(200)
 
-    # ---------- Trends ----------
+    # -------- Trends ----------
     @output
     @render.plot
     def p_genre_avg():
         d = df_joined()
         fig,ax=plt.subplots(figsize=(9,3.8))
-        if d.empty or "genres" not in d:
+        if d.empty or "genres" not in d or "averageRating" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Genre-Daten",ha="center",va="center"); return fig
         g = d[d["numVotes"].fillna(0)>=50_000].dropna(subset=["genres"]).assign(
             genre=lambda x: x["genres"].astype(str).str.split(",")
@@ -332,7 +347,7 @@ def server(input: Inputs, output: Outputs, session: Session):
     def p_decade_avg():
         d = df_joined()
         fig,ax=plt.subplots(figsize=(9,3.8))
-        if d.empty or "year" not in d:
+        if d.empty or "year" not in d or "averageRating" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Jahresdaten",ha="center",va="center"); return fig
         dec = d.dropna(subset=["year"]).copy()
         if dec.empty:
@@ -344,15 +359,14 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("Ø IMDb (x10) nach Jahrzehnt")
         return fig
 
-    # ---------- Top 20 ----------
+    # -------- Top 20 ----------
     @output
     @render.plot
     def p_top20():
         d = top20_raw.copy()
         fig,ax=plt.subplots(figsize=(9,5))
-        if d.empty:
+        if d.empty or "numVotes" not in d or "title" not in d or "year" not in d:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Top-20-Daten",ha="center",va="center"); return fig
-        # erwartete Spalten: tconst, title, year, averageRating, numVotes
         d = d.sort_values("numVotes", ascending=True).tail(20)
         labels = d["title"].astype(str) + " (" + d["year"].astype(str) + ")"
         ax.barh(labels, d["numVotes"].values)
@@ -366,14 +380,15 @@ def server(input: Inputs, output: Outputs, session: Session):
         if d.empty:
             return pd.DataFrame(columns=["Titel","Jahr","IMDb (x10)","Stimmen","tconst"])
         d = d.sort_values("numVotes", ascending=False).head(20)
-        d["IMDb (x10)"] = (d.get("averageRating", pd.Series(index=d.index))*10).round(1)
+        if "averageRating" in d:
+            d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
         d = d.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
         cols=["Titel","Jahr","IMDb (x10)","Stimmen","tconst"]
         for c in cols:
             if c not in d.columns: d[c]=pd.NA
         return d[cols]
 
-    # ---------- Google Trends ----------
+    # -------- Google Trends ----------
     @output
     @render.plot
     def p_gtrends():
@@ -396,16 +411,16 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = gtr_raw.copy()
         return d if not d.empty else pd.DataFrame(columns=["date","kw1","kw2","kw3","kw4","kw5"])
 
-    # ---------- Tabellen (gefiltert) ----------
+    # -------- Tabelle (gefiltert) ----------
     @output
     @render.data_frame
     def tbl_all():
         d = df_joined().copy()
         if d.empty:
             return pd.DataFrame(columns=["Titel","Jahr","IMDb (x10)","RT Tomatometer","RT Audience","Stimmen","genres","tconst"])
-        d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
-        d["RT Tomatometer"] = d.get("rt_tomato", pd.Series(index=d.index)).round(1)
-        d["RT Audience"] = d.get("rt_audience", pd.Series(index=d.index)).round(1)
+        if "averageRating" in d: d["IMDb (x10)"] = (d["averageRating"]*10).round(1)
+        if "rt_tomato" in d: d["RT Tomatometer"] = d["rt_tomato"].round(1)
+        if "rt_audience" in d: d["RT Audience"] = d["rt_audience"].round(1)
         d = d.rename(columns={"title":"Titel","year":"Jahr","numVotes":"Stimmen"})
         cols=["Titel","Jahr","IMDb (x10)","RT Tomatometer","RT Audience","Stimmen","genres","tconst"]
         for c in cols:
