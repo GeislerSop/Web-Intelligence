@@ -5,10 +5,19 @@ import re, logging, warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import textwrap
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
+
+# optional: Graph-Plot (wenn installiert)
+try:
+    import networkx as nx  # type: ignore
+    HAS_NX = True
+except Exception:
+    nx = None
+    HAS_NX = False
 
 # Warnings leiser
 np.seterr(all="ignore")
@@ -33,8 +42,16 @@ CSV_RT_RAW   = _find(BASE/"outputs/rotten_tomatoes_movies.csv", BASE/"raw/rotten
 CSV_TOP20    = _find(BASE/"outputs/top20_by_votes_imdb.csv", BASE/"top20_by_votes_imdb.csv")
 CSV_GTR      = _find(BASE/"outputs/google_trends_top5.csv", BASE/"google_trends_top5.csv")
 
+# --- Textdaten (Wikidata Cache)
+CSV_WD_TEXT  = _find(BASE/"outputs/text_wikidata_cache.csv", BASE/"text_wikidata_cache.csv")
+
+# --- NEU: Graphdaten (Edges) im gewünschten Format:
+# source,target,relation,source_type,target_type,source_norm,target_norm
+CSV_EDGES    = _find(BASE/"outputs/edges.csv", BASE/"edges.csv")
+
 def _read_csv(p: Path|None) -> pd.DataFrame:
-    if p is None: return pd.DataFrame()
+    if p is None:
+        return pd.DataFrame()
     try:
         df = pd.read_csv(p)
         LOG.info(f"Loaded {p} shape={df.shape}")
@@ -48,6 +65,9 @@ rt_metrics = _read_csv(CSV_RT_METR)
 rt_raw     = _read_csv(CSV_RT_RAW)
 top20_raw  = _read_csv(CSV_TOP20)
 gtr_raw    = _read_csv(CSV_GTR)
+
+wd_text_raw = _read_csv(CSV_WD_TEXT)
+edges_raw   = _read_csv(CSV_EDGES)
 
 # ---------------- Helpers ----------------
 def norm_title(t: str) -> str:
@@ -154,6 +174,75 @@ def joined_for_visuals() -> pd.DataFrame:
     if "numVotes" in df:      df["IMDb_Votes"] = pd.to_numeric(df["numVotes"], errors="coerce").astype("Int64")
     return df
 
+# ---------------- Wikidata Text standardisieren ----------------
+def std_wd_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Wikidata-Textcache robust vereinheitlichen -> title, title_norm, description, qid(optional)."""
+    if df.empty:
+        return pd.DataFrame(columns=["title","title_norm","description","qid"])
+    L = {c.lower(): c for c in df.columns}
+    def pick(*xs):
+        for x in xs:
+            if x in L: return L[x]
+        return None
+
+    c_title = pick("title", "label", "movie", "film", "name")
+    c_desc  = pick("description", "desc", "text", "plot", "abstract", "summary")
+    c_qid   = pick("qid", "id", "wikidata_id", "entity", "item")
+
+    keep = [c for c in [c_title, c_desc, c_qid] if c]
+    d = df[keep].copy() if keep else df.copy()
+    if c_title and c_title != "title":
+        d.rename(columns={c_title: "title"}, inplace=True)
+    if c_desc and c_desc != "description":
+        d.rename(columns={c_desc: "description"}, inplace=True)
+    if c_qid and c_qid != "qid":
+        d.rename(columns={c_qid: "qid"}, inplace=True)
+
+    if "title" not in d.columns:
+        d["title"] = df.iloc[:, 0].astype(str)
+    if "description" not in d.columns:
+        d["description"] = ""
+
+    d["title"] = d["title"].astype(str)
+    d["title_norm"] = d["title"].map(norm_title)
+    if "qid" not in d.columns:
+        d["qid"] = pd.NA
+    d["description"] = d["description"].astype(str).fillna("")
+    d = d.dropna(subset=["title_norm"]).drop_duplicates(subset=["title_norm"])
+    return d[["title","title_norm","description","qid"]]
+
+wd_text = std_wd_text(wd_text_raw)
+
+# ---------------- NEU: Edges (typed) standardisieren – passend zu deinem Format ----------------
+def std_edges_typed(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Erwartetes Format:
+    source,target,relation,source_type,target_type,source_norm,target_norm
+    """
+    cols = ["source","target","relation","source_type","target_type","source_norm","target_norm"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    need = set(cols)
+    if not need.issubset(df.columns):
+        # Wenn du mal eine andere Edges-Datei reinwirfst, lieber leer statt crash
+        missing = sorted(list(need - set(df.columns)))
+        LOG.warning(f"edges.csv missing columns: {missing} -> graph tab disabled")
+        return pd.DataFrame(columns=cols)
+
+    d = df.copy()
+    for c in cols:
+        d[c] = d[c].astype(str)
+
+    d["source_norm"] = d["source_norm"].map(norm_title)
+    d["target_norm"] = d["target_norm"].map(norm_title)
+
+    d = d[(d["source_norm"] != "") & (d["target_norm"] != "")]
+    d = d.drop_duplicates(subset=["source","target","relation","source_type","target_type"])
+    return d[cols]
+
+edges = std_edges_typed(edges_raw)
+
 # ---------------- UI ----------------
 app_ui = ui.page_sidebar(
     ui.sidebar(
@@ -176,6 +265,8 @@ app_ui = ui.page_sidebar(
                 "top20":"Top 20",
                 "gtrends":"Google Trends",
                 "rt_only":"RT (nur RT-Daten)",
+                "wikidata":"Wikidata Analyse (Text)",
+                "graph":"Graph (Edges: Movie/Actor/Genre)",   # <-- NEU
                 "table":"Tabelle",
             },
             selected="overview", inline=False
@@ -186,6 +277,16 @@ app_ui = ui.page_sidebar(
         ui.input_numeric("year_end",   "Jahr bis",  2025, min=1920, max=2025, step=1),
         ui.input_numeric("min_votes",  "Mind. IMDb-Stimmen (Filter)", value=50000, min=0, step=1000),
         ui.input_checkbox("use_audience", "RT Audience mit anzeigen", True),
+
+        ui.tags.hr(),
+        ui.tags.div("Wikidata (Text)", class_="muted"),
+        ui.input_selectize("wd_title", "Film auswählen", choices=[], selected=None, multiple=False),
+
+        ui.tags.hr(),
+        ui.tags.div("Graph (Edges)", class_="muted"),
+        ui.input_selectize("graph_node", "Knoten auswählen", choices=[], selected=None, multiple=False),
+        ui.input_numeric("graph_hops", "Hops (1=Nachbarn, 2=Nachbarn der Nachbarn)", value=1, min=1, max=2, step=1),
+
         ui.tags.hr(),
         ui.tags.div("Status", class_="muted"),
         ui.output_ui("status_files"),
@@ -200,7 +301,46 @@ app_ui = ui.page_sidebar(
 # ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
 
-    # Status / Quelle anzeigen
+    # -------- Wikidata Dropdown choices --------
+    @reactive.Effect
+    def _init_wd_choices():
+        if wd_text.empty:
+            choices = {}
+        else:
+            tmp = wd_text.copy()
+            tmp["label"] = tmp["title"]
+            if "qid" in tmp.columns and tmp["qid"].notna().any():
+                tmp["label"] = tmp.apply(lambda r: f"{r['title']}  ·  {r['qid']}" if pd.notna(r["qid"]) else r["title"], axis=1)
+            tmp = tmp.sort_values("title").head(5000)
+            choices = {r["title_norm"]: r["label"] for _, r in tmp.iterrows()}
+
+        ui.update_selectize("wd_title", choices=choices)
+        if input.wd_title() is None and choices:
+            ui.update_selectize("wd_title", selected=next(iter(choices.keys())))
+
+    # -------- Graph Dropdown choices (aus edges.csv) --------
+    @reactive.Effect
+    def _init_graph_choices():
+        if edges.empty:
+            ui.update_selectize("graph_node", choices={})
+            return
+
+        nodes_src = edges[["source","source_norm","source_type"]].rename(
+            columns={"source":"label","source_norm":"norm","source_type":"type"}
+        )
+        nodes_tgt = edges[["target","target_norm","target_type"]].rename(
+            columns={"target":"label","target_norm":"norm","target_type":"type"}
+        )
+        nodes = pd.concat([nodes_src, nodes_tgt], ignore_index=True).drop_duplicates(subset=["norm","type"])
+
+        nodes = nodes.sort_values(["type","label"]).head(8000)
+        choices = {f"{r['type']}::{r['norm']}": f"{r['type']}: {r['label']}" for _, r in nodes.iterrows()}
+
+        ui.update_selectize("graph_node", choices=choices)
+        if input.graph_node() is None and choices:
+            ui.update_selectize("graph_node", selected=next(iter(choices.keys())))
+
+    # -------- Status / Quelle anzeigen --------
     @output
     @render.ui
     def status_files():
@@ -213,10 +353,16 @@ def server(input: Inputs, output: Outputs, session: Session):
             li(CSV_GTR is not None, f"gtr   : {CSV_GTR}    (shape={tuple(gtr_raw.shape)})"),
             ui.tags.li(f"RT-Quelle aktiv: {RT_SOURCE}"),
             ui.tags.li(f"RT-Datensätze (≤2020): {len(rt_std):,}".replace(",", ".")),
+            ui.tags.li("—"),
+            li(CSV_WD_TEXT is not None, f"wikidata_text: {CSV_WD_TEXT} (shape={tuple(wd_text_raw.shape)})"),
+            li(CSV_EDGES is not None, f"edges: {CSV_EDGES} (shape={tuple(edges_raw.shape)})"),
+            ui.tags.li(f"Wikidata-Texte (unique titles): {len(wd_text):,}".replace(",", ".")),
+            ui.tags.li(f"Edges (typed): {len(edges):,}".replace(",", ".")),
+            ui.tags.li(f"networkx verfügbar: {'ja' if HAS_NX else 'nein (Fallback)'}"),
         ]
         return ui.tags.small(ui.tags.ul(*rows, style="margin:0;padding-left:18px;"))
 
-    # Daten-Sichten
+    # -------- Daten-Sichten --------
     @reactive.Calc
     def df_joined():
         df = joined_for_visuals().copy()
@@ -236,13 +382,66 @@ def server(input: Inputs, output: Outputs, session: Session):
         col = "RT_Tomatometer"
         return d[d[col].notna()] if not d.empty and col in d.columns else d.iloc[0:0]
 
+    # -------- Wikidata selected --------
     @reactive.Calc
-    def df_without_rt():
-        d = df_joined()
-        col = "RT_Tomatometer"
-        return d[d[col].isna()] if not d.empty and col in d.columns else d
+    def wd_selected_row() -> pd.Series:
+        key = input.wd_title()
+        if wd_text.empty or key is None:
+            return pd.Series({"title":"", "title_norm":"", "description":"", "qid":pd.NA})
+        hit = wd_text[wd_text["title_norm"] == key]
+        if hit.empty:
+            return pd.Series({"title":"", "title_norm":str(key), "description":"", "qid":pd.NA})
+        return hit.iloc[0]
 
-    # Titel
+    # -------- Graph selected + Subgraph (1–2 hops) --------
+    @reactive.Calc
+    def graph_selected() -> tuple[str,str]:
+        k = input.graph_node()
+        if not k or "::" not in str(k):
+            return ("", "")
+        t, n = str(k).split("::", 1)
+        return (t.strip(), n.strip())
+
+    @reactive.Calc
+    def graph_sub_edges() -> pd.DataFrame:
+        if edges.empty:
+            return edges.iloc[0:0]
+
+        node_type, node_norm = graph_selected()
+        if not node_type or not node_norm:
+            return edges.iloc[0:0]
+
+        hops = int(input.graph_hops())
+        hops = 1 if hops < 1 else (2 if hops > 2 else hops)
+
+        sub = edges[
+            ((edges["source_type"] == node_type) & (edges["source_norm"] == node_norm)) |
+            ((edges["target_type"] == node_type) & (edges["target_norm"] == node_norm))
+        ].copy()
+
+        if hops == 1:
+            return sub.head(400)
+
+        # 2-hop: Nachbarn sammeln
+        neigh: set[tuple[str,str]] = set()
+        for _, r in sub.iterrows():
+            if r["source_type"] == node_type and r["source_norm"] == node_norm:
+                neigh.add((r["target_type"], r["target_norm"]))
+            if r["target_type"] == node_type and r["target_norm"] == node_norm:
+                neigh.add((r["source_type"], r["source_norm"]))
+
+        mask = pd.Series(False, index=edges.index)
+        for (t, n) in neigh:
+            mask = mask | (
+                ((edges["source_type"] == t) & (edges["source_norm"] == n)) |
+                ((edges["target_type"] == t) & (edges["target_norm"] == n))
+            )
+        sub2 = edges[mask].copy()
+
+        out = pd.concat([sub, sub2], ignore_index=True).drop_duplicates()
+        return out.head(600)
+
+    # ---------------- Titel ----------------
     @output
     @render.ui
     def page_title():
@@ -254,11 +453,13 @@ def server(input: Inputs, output: Outputs, session: Session):
             "top20":"Top 20 (IMDb-Stimmen)",
             "gtrends":"Google Trends",
             "rt_only":"Rotten Tomatoes — eigene Sicht",
+            "wikidata":"Wikidata Analyse — Text",
+            "graph":"Graph — Movie / Actor / Genre",
             "table":"Tabelle (gefiltert)",
         }
         return ui.tags.h3(mapping.get(input.page(),"Übersicht"))
 
-    # Routing
+    # ---------------- Routing ----------------
     @output
     @render.ui
     def page_body():
@@ -270,10 +471,18 @@ def server(input: Inputs, output: Outputs, session: Session):
         if p == "top20":     return ui.div(ui.output_plot("p_top20"), ui.output_data_frame("tbl_top20"))
         if p == "gtrends":   return ui.div(ui.output_plot("p_gtrends"), ui.output_data_frame("tbl_gtrends"))
         if p == "rt_only":   return ui.div(ui.output_plot("p_rt_only_avg"))
+        if p == "wikidata":  return ui.div(
+            ui.output_ui("wd_text_block"),
+            ui.card(ui.card_header("Top-Wörter (Beschreibung)"), ui.output_data_frame("tbl_wd_terms")),
+        )
+        if p == "graph":     return ui.div(
+            ui.card(ui.card_header("Graph-Ausschnitt"), ui.output_plot("p_graph_edges")),
+            ui.card(ui.card_header("Edge-Liste (Subgraph)"), ui.output_data_frame("tbl_graph_edges")),
+        )
         if p == "table":     return ui.div(ui.output_data_frame("tbl_all"))
         return ui.div("—")
 
-    # KPIs
+    # ---------------- KPIs ----------------
     def kpi_ui():
         d_all = df_joined()
         d_rt  = df_with_rt()
@@ -293,7 +502,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         cards.append(vb("RT-Abdeckung", f"{share:.1f}%"))
         return ui.layout_column_wrap(*cards, fill=False)
 
-    # Übersicht: Balken + CCDF
+    # ---------------- Übersicht: Balken + CCDF ----------------
     @output
     @render.plot
     def p_avg_bars():
@@ -339,7 +548,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_ylim(0,1)
         return fig
 
-    # Vergleich: Scatter + Ø-Differenz je Bin
+    # ---------------- Vergleich: Scatter + Ø-Differenz je Bin ----------------
     @output
     @render.plot
     def p_scatter_simple():
@@ -362,6 +571,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         fig, ax = plt.subplots(figsize=(9,3.8))
         if d.empty:
             ax.axis("off"); ax.text(0.5,0.5,"Keine Daten",ha="center",va="center"); return fig
+        d = d.copy()
         d["bin"] = (d["IMDb_Score_100"]//10*10).astype(int).clip(0,90)
         s = d.groupby("bin").apply(lambda x: (x["RT_Tomatometer"] - x["IMDb_Score_100"]).mean())
         ax.plot(s.index, s.values, marker="o", color="#EF4444", linewidth=2)
@@ -372,7 +582,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("Wo weichen RT und IMDb ab? (Ø Differenz je IMDb-Bin)")
         return fig
 
-    # Abdeckung + RT-Kreisdiagramm
+    # ---------------- Abdeckung + RT-Kreisdiagramm ----------------
     @output
     @render.plot
     def p_coverage_share():
@@ -407,7 +617,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("RT-Verteilung (Fresh ≥ 60)"); ax.axis("equal")
         return fig
 
-    # Trends (IMDb)
+    # ---------------- Trends (IMDb) ----------------
     @output
     @render.plot
     def p_genre_avg():
@@ -448,7 +658,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_title("Wie haben sich Ø-Bewertungen je Jahrzehnt entwickelt?")
         return fig
 
-    # Top 20
+    # ---------------- Top 20 ----------------
     @output
     @render.plot
     def p_top20():
@@ -477,7 +687,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             if c not in d.columns: d[c]=pd.NA
         return d[cols]
 
-    # Google Trends
+    # ---------------- Google Trends ----------------
     @output
     @render.plot
     def p_gtrends():
@@ -499,7 +709,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = gtr_raw.copy()
         return d if not d.empty else pd.DataFrame(columns=["date","kw1","kw2","kw3","kw4","kw5"])
 
-    # Tabelle (gefiltert)
+    # ---------------- Tabelle (gefiltert) ----------------
     @output
     @render.data_frame
     def tbl_all():
@@ -514,7 +724,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             if c not in d.columns: d[c]=pd.NA
         return d[cols].sort_values("IMDb_Votes", ascending=False)
 
-    # RT-only Seite (nur RT, bis 2020)
+    # ---------------- RT-only Seite (nur RT, bis 2020) ----------------
     @output
     @render.plot
     def p_rt_only_avg():
@@ -535,6 +745,112 @@ def server(input: Inputs, output: Outputs, session: Session):
         for i,v in enumerate(values):
             ax.text(i, v+1, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
         ax.set_ylim(0,100); ax.set_title("Rotten Tomatoes (nur RT-Daten, bis 2020) — Ø Werte"); ax.set_ylabel("Punkte")
+        return fig
+
+    # ---------------- Wikidata Outputs ----------------
+    @output
+    @render.ui
+    def wd_text_block():
+        row = wd_selected_row()
+        title = str(row.get("title","")) or "—"
+        desc = str(row.get("description","")) or ""
+        qid = row.get("qid", pd.NA)
+        meta = []
+        if pd.notna(qid):
+            meta.append(f"QID: {qid}")
+        meta.append(f"Beschreibungslänge: {len(desc):,} Zeichen".replace(",", "."))
+        return ui.card(
+            ui.card_header(f"📄 Beschreibung: {title}"),
+            ui.tags.div(" · ".join(meta), class_="muted", style="margin-bottom:8px;"),
+            ui.tags.pre(textwrap.fill(desc, width=110) if desc else "Keine Beschreibung im Cache gefunden.",
+                       style="white-space:pre-wrap;margin:0;")
+        )
+
+    @output
+    @render.data_frame
+    def tbl_wd_terms():
+        row = wd_selected_row()
+        txt = str(row.get("description","") or "")
+        if not txt.strip():
+            return pd.DataFrame(columns=["Wort","Häufigkeit"])
+        stop = set("""
+        the a an and or of to in on for with as is are was were be been being at by from this that it its
+        der die das ein eine und oder zu im in auf für mit als ist sind war waren sein
+        """.split())
+        words = re.findall(r"[A-Za-zÄÖÜäöüß']{3,}", txt.lower())
+        words = [w for w in words if w not in stop]
+        if not words:
+            return pd.DataFrame(columns=["Wort","Häufigkeit"])
+        s = pd.Series(words).value_counts().head(20)
+        return pd.DataFrame({"Wort": s.index, "Häufigkeit": s.values})
+
+    # ---------------- Graph Outputs ----------------
+    @output
+    @render.data_frame
+    def tbl_graph_edges():
+        d = graph_sub_edges()
+        if d.empty:
+            return pd.DataFrame(columns=["Quelle","Relation","Ziel","Quelle_Typ","Ziel_Typ"])
+        show = d[["source","relation","target","source_type","target_type"]].copy()
+        show.columns = ["Quelle","Relation","Ziel","Quelle_Typ","Ziel_Typ"]
+        return show
+
+    @output
+    @render.plot
+    def p_graph_edges():
+        fig, ax = plt.subplots(figsize=(9,5))
+        d = graph_sub_edges()
+        if d.empty:
+            ax.axis("off")
+            ax.text(0.5, 0.5, "Keine Edges für die aktuelle Auswahl.", ha="center", va="center")
+            return fig
+
+        node_type, node_norm = graph_selected()
+
+        if HAS_NX:
+            G = nx.Graph()
+            for _, r in d.iterrows():
+                s = f"{r['source_type']}:{r['source']}"
+                t = f"{r['target_type']}:{r['target']}"
+                G.add_edge(s, t, relation=r["relation"])
+
+            try:
+                pos = nx.spring_layout(G, seed=42, k=0.8)
+            except Exception:
+                pos = nx.random_layout(G, seed=42)
+
+            nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.35, width=1.2)
+            nx.draw_networkx_nodes(G, pos, ax=ax, node_size=220)
+
+            # Fokusnode bestimmen
+            focus = None
+            for n in G.nodes:
+                if n.startswith(node_type + ":"):
+                    if norm_title(n.split(":",1)[1]) == node_norm:
+                        focus = n
+                        break
+
+            labels = {}
+            if focus and focus in G:
+                labels[focus] = focus
+                for nb in list(G.neighbors(focus))[:14]:
+                    labels[nb] = nb
+
+            nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=8)
+            ax.set_title(
+                f"Subgraph (Hops={int(input.graph_hops())}) — "
+                f"Nodes={G.number_of_nodes()}  Edges={G.number_of_edges()}"
+            )
+            ax.axis("off")
+            return fig
+
+        # Fallback ohne networkx
+        ax.axis("off")
+        lines = []
+        for _, r in d.head(25).iterrows():
+            lines.append(f"{r['source_type']}:{r['source']}  --{r['relation']}-->  {r['target_type']}:{r['target']}")
+        ax.text(0.01, 0.99, "\n".join(lines), ha="left", va="top", family="monospace", fontsize=9)
+        ax.set_title("Graph-Fallback (erste 25 Kanten)")
         return fig
 
 app = App(app_ui, server)
