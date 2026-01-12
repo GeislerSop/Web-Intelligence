@@ -1,36 +1,40 @@
-# app.py — Movie Ratings Dashboard
-# - Ratings: nutzt rt_metrics.csv bevorzugt (Fallback: rotten_tomatoes_movies.csv raw)
-# - Text + Graph: nutzt rotten_tomatoes_movies.csv (movie_info / critics_consensus + actor/genre/etc.)
+# app.py — Movie Ratings Dashboard (+ RT-Text, Graph & OpenAI-Analyse)
 from __future__ import annotations
 
-import re, logging, warnings
+import os, re, json, logging, warnings, textwrap
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import textwrap
-import matplotlib
 
+import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from shiny import App, ui, render, reactive, Inputs, Outputs, Session
 
-# optional: networkx (wenn installiert -> schöneres Layout)
+# optional: nicer graph plot (wenn installiert)
 try:
     import networkx as nx  # type: ignore
-
     HAS_NX = True
 except Exception:
     nx = None
     HAS_NX = False
+
+# optional: OpenAI API Call via requests
+try:
+    import requests  # type: ignore
+    HAS_REQUESTS = True
+except Exception:
+    requests = None
+    HAS_REQUESTS = False
 
 # Warnings leiser
 np.seterr(all="ignore")
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ---------------- Logging ----------------
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 LOG = logging.getLogger("movie-app")
 
 # ---------------- Pfade/Loader ----------------
@@ -46,9 +50,7 @@ def _find(*candidates: Path) -> Path | None:
 
 CSV_JOINED = _find(BASE / "outputs/joined_imdb_rt.csv", BASE / "joined_imdb_rt.csv")
 CSV_RT_METR = _find(BASE / "outputs/rt_metrics.csv")
-CSV_RT_RAW = _find(
-    BASE / "outputs/rotten_tomatoes_movies.csv", BASE / "raw/rotten_tomatoes_movies.csv"
-)
+CSV_RT_RAW = _find(BASE / "outputs/rotten_tomatoes_movies.csv", BASE / "raw/rotten_tomatoes_movies.csv")
 CSV_TOP20 = _find(BASE / "outputs/top20_by_votes_imdb.csv", BASE / "top20_by_votes_imdb.csv")
 CSV_GTR = _find(BASE / "outputs/google_trends_top5.csv", BASE / "google_trends_top5.csv")
 
@@ -90,34 +92,25 @@ def to100(x):
         return np.nan
 
 
-def _pick_col(df: pd.DataFrame, *names: str) -> str | None:
-    L = {c.lower(): c for c in df.columns}
-    for n in names:
-        if n.lower() in L:
-            return L[n.lower()]
-    return None
-
-
-def _split_list_field(x: str) -> List[str]:
+def split_list(x) -> list[str]:
+    """Komma-separierte Listen robust splitten (Genres/Actors/Directors)."""
     if pd.isna(x):
         return []
-    parts = [p.strip() for p in str(x).split(",")]
-    return [p for p in parts if p]
+    s = str(x).strip()
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    parts = [p for p in parts if p]
+    # kleine Normalisierung (Doppelleerzeichen etc.)
+    parts = [" ".join(p.split()) for p in parts]
+    return parts
 
 
-def _short_label(s: str, maxlen: int = 18) -> str:
-    s = str(s)
-    if len(s) <= maxlen:
-        return s
-    return s[: maxlen - 1] + "…"
-
-
-# ---------------- Ratings: RT standardisieren (für Merge mit joined) ----------------
+# ---------------- RT Scores (wie vorher) ----------------
 def std_rt_from_raw(df: pd.DataFrame) -> pd.DataFrame:
-    """Fallback: RT-Rohdatei in Standardform bringen (ratings)."""
+    """Fallback: RT-Rohdatei in Standardform bringen."""
     if df.empty:
         return pd.DataFrame(columns=["title_norm", "year", "rt_tomato", "rt_audience"])
-
     L = {c.lower(): c for c in df.columns}
 
     def pick(*xs):
@@ -130,7 +123,6 @@ def std_rt_from_raw(df: pd.DataFrame) -> pd.DataFrame:
     c_info = pick("movie_info")
     c_tom = pick("tomatometer_rating", "tomato_score", "tomatometer", "rt", "rt_score")
     c_aud = pick("audience_rating", "audience_score", "audiencescore")
-
     keep = [c for c in [c_title, c_year, c_info, c_tom, c_aud] if c]
     d = df[keep].copy() if keep else df.iloc[0:0].copy()
     if d.empty:
@@ -153,13 +145,17 @@ def std_rt_from_raw(df: pd.DataFrame) -> pd.DataFrame:
     d["year"] = pd.to_numeric(d.get("year", pd.Series(index=d.index)), errors="coerce")
     if "info" in d and d["year"].isna().all():
         d["year"] = (
-            d["info"].astype(str).str.extract(r"\b(19|20)\d{2}\b", expand=False).astype(float)
+            d["info"]
+            .astype(str)
+            .str.extract(r"\b(19|20)\d{2}\b", expand=False)
+            .astype(float)
         )
-    d = d[d["year"].fillna(0) <= 2020]  # RT bis 2020
+
+    # RT bis 2020 (für Score-Join – Text/Graph darf trotzdem alle Jahre haben)
+    d = d[d["year"].fillna(0) <= 2020]
 
     d["rt_tomato"] = d.get("rt_tomato_raw", pd.Series(index=d.index)).map(to100)
     d["rt_audience"] = d.get("rt_audience_raw", pd.Series(index=d.index)).map(to100)
-
     return (
         d[["title_norm", "year", "rt_tomato", "rt_audience"]]
         .dropna(subset=["title_norm"])
@@ -175,7 +171,7 @@ def std_rt_from_metrics(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["title_norm"] = d["title_norm"].astype(str).map(norm_title)
     d["year"] = pd.to_numeric(d["year"], errors="coerce")
-    d = d[d["year"].fillna(0) <= 2020]
+    d = d[d["year"].fillna(0) <= 2020]  # RT bis 2020
     d["rt_tomato"] = pd.to_numeric(d["rt_tomato"], errors="coerce").clip(0, 100)
     d["rt_audience"] = pd.to_numeric(d["rt_audience"], errors="coerce").clip(0, 100)
     return (
@@ -202,27 +198,22 @@ def joined_for_visuals() -> pd.DataFrame:
         return joined_raw
     df = joined_raw.copy()
 
+    # einheitliche Namen
     if "year" not in df.columns and "Year" in df.columns:
         df.rename(columns={"Year": "year"}, inplace=True)
     if "numVotes" not in df.columns and "votes" in df.columns:
         df.rename(columns={"votes": "numVotes"}, inplace=True)
 
+    # merge RT (nur bis 2020, das macht rt_std bereits)
     cols = ["title_norm", "year"]
     if "year" in df:
         df["year"] = pd.to_numeric(df["year"], errors="coerce")
-
     if not rt_std.empty and all(c in df.columns for c in cols):
         df = df.merge(rt_std, on=cols, how="left", suffixes=("", "_rtstd"))
-        # vorhandene RT behalten, fehlende füllen
-        if "rt_tomato" not in df and "rt_tomato_rtstd" in df:
-            df["rt_tomato"] = df["rt_tomato_rtstd"]
-        else:
-            df["rt_tomato"] = df["rt_tomato"].fillna(df.get("rt_tomato_rtstd"))
-        if "rt_audience" not in df and "rt_audience_rtstd" in df:
-            df["rt_audience"] = df["rt_audience_rtstd"]
-        else:
-            df["rt_audience"] = df["rt_audience"].fillna(df.get("rt_audience_rtstd"))
+        df["rt_tomato"] = df.get("rt_tomato", pd.Series(index=df.index)).fillna(df.get("rt_tomato_rtstd"))
+        df["rt_audience"] = df.get("rt_audience", pd.Series(index=df.index)).fillna(df.get("rt_audience_rtstd"))
 
+    # UI-Spalten
     if "averageRating" in df:
         df["IMDb_Score_100"] = (df["averageRating"] * 10).clip(0, 100)
     if "rt_tomato" in df:
@@ -234,266 +225,197 @@ def joined_for_visuals() -> pd.DataFrame:
     return df
 
 
-# =========================
-# Text + Graph: aus rotten_tomatoes_movies.csv
-# =========================
-def std_rt_text_graph(df: pd.DataFrame) -> pd.DataFrame:
-    """Normiert RT raw für Text & Graph (Plot/Consensus + Genres + Actors ...)."""
+# ---------------- RT Textdaten (statt Wikidata) ----------------
+def std_rt_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Textquelle + Metadaten aus rotten_tomatoes_movies.csv:
+    - movie_info (Plot/Beschreibung)
+    - critics_consensus (Kurzfazit)
+    - genres, actors, directors
+    """
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "title",
-                "title_norm",
-                "year",
-                "movie_info",
-                "critics_consensus",
-                "genres",
-                "actors",
-                "directors",
-                "authors",
-                "rt_tomato",
-                "rt_audience",
-            ]
-        )
+        return pd.DataFrame(columns=["title", "title_norm", "year", "movie_info", "critics_consensus", "genres", "actors"])
 
-    c_title = _pick_col(df, "movie_title", "title", "name")
-    c_year = _pick_col(df, "original_release_year", "year")
-    c_date = _pick_col(df, "original_release_date")
-    c_info = _pick_col(df, "movie_info", "info", "plot", "synopsis")
-    c_cons = _pick_col(df, "critics_consensus", "consensus")
-    c_gen = _pick_col(df, "genres", "genre")
-    c_act = _pick_col(df, "actors", "cast")
-    c_dir = _pick_col(df, "directors", "director")
-    c_auth = _pick_col(df, "authors", "writer", "writers")
-    c_tom = _pick_col(df, "tomatometer_rating", "tomato_score", "rt_tomato")
-    c_aud = _pick_col(df, "audience_rating", "audience_score", "rt_audience")
+    L = {c.lower(): c for c in df.columns}
 
-    keep = [c for c in [c_title, c_year, c_date, c_info, c_cons, c_gen, c_act, c_dir, c_auth, c_tom, c_aud] if c]
+    def pick(*xs):
+        for x in xs:
+            if x in L:
+                return L[x]
+        return None
+
+    c_title = pick("movie_title", "title", "name")
+    c_year = pick("original_release_year", "year", "release_year")
+    c_info = pick("movie_info", "info", "plot", "description", "synopsis")
+    c_cons = pick("critics_consensus", "consensus", "summary")
+    c_gen = pick("genres", "genre")
+    c_act = pick("actors", "cast")
+
+    keep = [c for c in [c_title, c_year, c_info, c_cons, c_gen, c_act] if c]
     d = df[keep].copy() if keep else df.copy()
 
+    ren = {}
     if c_title:
-        d.rename(columns={c_title: "title"}, inplace=True)
-    if c_info:
-        d.rename(columns={c_info: "movie_info"}, inplace=True)
-    if c_cons:
-        d.rename(columns={c_cons: "critics_consensus"}, inplace=True)
-    if c_gen:
-        d.rename(columns={c_gen: "genres"}, inplace=True)
-    if c_act:
-        d.rename(columns={c_act: "actors"}, inplace=True)
-    if c_dir:
-        d.rename(columns={c_dir: "directors"}, inplace=True)
-    if c_auth:
-        d.rename(columns={c_auth: "authors"}, inplace=True)
-    if c_tom:
-        d.rename(columns={c_tom: "rt_tomato"}, inplace=True)
-    if c_aud:
-        d.rename(columns={c_aud: "rt_audience"}, inplace=True)
-
-    if "year" not in d.columns:
-        d["year"] = pd.NA
-
+        ren[c_title] = "title"
     if c_year:
-        d["year"] = pd.to_numeric(d.get("year"), errors="coerce")
-    if (d["year"].isna().all() or "year" not in d.columns) and c_date:
-        d["year"] = pd.to_datetime(df[c_date], errors="coerce").dt.year
+        ren[c_year] = "year"
+    if c_info:
+        ren[c_info] = "movie_info"
+    if c_cons:
+        ren[c_cons] = "critics_consensus"
+    if c_gen:
+        ren[c_gen] = "genres"
+    if c_act:
+        ren[c_act] = "actors"
+    d.rename(columns=ren, inplace=True)
 
-    d["title"] = d.get("title", "").astype(str)
-    d["title_norm"] = d["title"].map(norm_title)
-
-    for col in ["movie_info", "critics_consensus", "genres", "actors", "directors", "authors"]:
+    for col in ["title", "movie_info", "critics_consensus", "genres", "actors"]:
         if col not in d.columns:
             d[col] = ""
-        d[col] = d[col].astype(str).fillna("")
 
-    d["rt_tomato"] = pd.to_numeric(d.get("rt_tomato", pd.NA), errors="coerce").clip(0, 100)
-    d["rt_audience"] = pd.to_numeric(d.get("rt_audience", pd.NA), errors="coerce").clip(0, 100)
+    d["title"] = d["title"].astype(str)
+    d["title_norm"] = d["title"].map(norm_title)
 
-    d = d.dropna(subset=["title_norm"]).drop_duplicates(subset=["title_norm"])
-    return d[
-        [
-            "title",
-            "title_norm",
-            "year",
-            "movie_info",
-            "critics_consensus",
-            "genres",
-            "actors",
-            "directors",
-            "authors",
-            "rt_tomato",
-            "rt_audience",
-        ]
-    ]
+    d["year"] = pd.to_numeric(d.get("year", pd.Series(index=d.index)), errors="coerce")
+
+    d["movie_info"] = d["movie_info"].astype(str).fillna("").replace({"nan": ""})
+    d["critics_consensus"] = d["critics_consensus"].astype(str).fillna("").replace({"nan": ""})
+    d["genres"] = d["genres"].astype(str).fillna("").replace({"nan": ""})
+    d["actors"] = d["actors"].astype(str).fillna("").replace({"nan": ""})
+
+    d = d.dropna(subset=["title_norm"]).drop_duplicates(subset=["title_norm", "year"])
+    return d[["title", "title_norm", "year", "movie_info", "critics_consensus", "genres", "actors"]]
 
 
-rt_tg = std_rt_text_graph(rt_raw)
+rt_text = std_rt_text(rt_raw)
 
 
-def build_edges_from_rt(df: pd.DataFrame) -> pd.DataFrame:
-    """Edges aus RT raw erzeugen (movie->genre/actor/director/author + actor->genre abgeleitet)."""
+# ---------------- Graph aus RT bauen (Movie–Genre, Movie–Actor, Actor–Genre) ----------------
+def build_edges_from_rt(rt_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Erzeugt typed edges:
+    source,target,relation,source_type,target_type,source_norm,target_norm
+    """
     cols = ["source", "target", "relation", "source_type", "target_type", "source_norm", "target_norm"]
-    if df.empty:
+    if rt_df.empty:
         return pd.DataFrame(columns=cols)
 
-    rows: List[Dict] = []
-    for _, r in df.iterrows():
+    rows = []
+    for _, r in rt_df.iterrows():
         title = str(r.get("title", "")).strip()
-        if not title:
+        tn = str(r.get("title_norm", "")).strip()
+        if not title or not tn:
             continue
 
-        m_norm = norm_title(title)
-        genres = _split_list_field(r.get("genres", ""))
-        actors = _split_list_field(r.get("actors", ""))
-        directors = _split_list_field(r.get("directors", ""))
-        authors = _split_list_field(r.get("authors", ""))
+        genres = split_list(r.get("genres", ""))
+        actors = split_list(r.get("actors", ""))
 
+        # Movie -> Genre
         for g in genres:
-            rows.append(
-                dict(
-                    source=title,
-                    target=g,
-                    relation="has_genre",
-                    source_type="movie",
-                    target_type="genre",
-                    source_norm=m_norm,
-                    target_norm=norm_title(g),
-                )
-            )
-        for a in actors:
-            rows.append(
-                dict(
-                    source=title,
-                    target=a,
-                    relation="has_actor",
-                    source_type="movie",
-                    target_type="actor",
-                    source_norm=m_norm,
-                    target_norm=norm_title(a),
-                )
-            )
-        for d in directors:
-            rows.append(
-                dict(
-                    source=title,
-                    target=d,
-                    relation="directed_by",
-                    source_type="movie",
-                    target_type="director",
-                    source_norm=m_norm,
-                    target_norm=norm_title(d),
-                )
-            )
-        for au in authors:
-            rows.append(
-                dict(
-                    source=title,
-                    target=au,
-                    relation="written_by",
-                    source_type="movie",
-                    target_type="author",
-                    source_norm=m_norm,
-                    target_norm=norm_title(au),
-                )
-            )
+            gn = norm_title(g)
+            if not gn:
+                continue
+            rows.append((title, g, "has_genre", "movie", "genre", tn, gn))
 
-        # actor -> genre (abgeleitet)
+        # Movie -> Actor
         for a in actors:
-            a_norm = norm_title(a)
+            an = norm_title(a)
+            if not an:
+                continue
+            rows.append((title, a, "has_actor", "movie", "actor", tn, an))
+
+        # Actor -> Genre (aus demselben Film abgeleitet)
+        for a in actors:
+            an = norm_title(a)
+            if not an:
+                continue
             for g in genres:
-                rows.append(
-                    dict(
-                        source=a,
-                        target=g,
-                        relation="acts_in_genre",
-                        source_type="actor",
-                        target_type="genre",
-                        source_norm=a_norm,
-                        target_norm=norm_title(g),
-                    )
-                )
+                gn = norm_title(g)
+                if not gn:
+                    continue
+                rows.append((a, g, "actor_in_genre", "actor", "genre", an, gn))
 
     e = pd.DataFrame(rows, columns=cols)
-    if e.empty:
-        return pd.DataFrame(columns=cols)
-
-    for c in cols:
-        e[c] = e[c].astype(str)
-
-    e["source_norm"] = e["source_norm"].map(norm_title)
-    e["target_norm"] = e["target_norm"].map(norm_title)
-    e = e[(e["source_norm"] != "") & (e["target_norm"] != "")]
-    e = e.drop_duplicates(subset=["source", "target", "relation", "source_type", "target_type"])
-    return e[cols]
+    e = e.drop_duplicates()
+    return e
 
 
-edges = build_edges_from_rt(rt_tg)
+edges = build_edges_from_rt(rt_text)
 
-# =========================
-# Fallback: hübsches Force-Layout ohne networkx
-# =========================
-def spring_layout_numpy(nodes: List[str], edges_pairs: List[Tuple[str, str]], seed: int = 42, iters: int = 250) -> Dict[str, Tuple[float, float]]:
+# ---------------- OpenAI: Textanalyse Funktion ----------------
+def openai_analyze_text(text: str) -> dict:
     """
-    Sehr simples Force-Directed Layout (Fruchterman-Reingold inspiriert).
-    Reicht für einen "Netzplan", wenn networkx nicht verfügbar ist.
+    Nutzt Responses API (empfohlen) über HTTP.
+    Erwartet OPENAI_API_KEY als Environment Variable.
+    Gibt dict mit summary/sentiment/topics zurück.
     """
-    rng = np.random.default_rng(seed)
-    n = len(nodes)
-    if n == 0:
-        return {}
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        return {"error": "OPENAI_API_KEY ist nicht gesetzt (Environment Variable fehlt)."}
+    if not HAS_REQUESTS:
+        return {"error": "Python-Paket 'requests' ist nicht verfügbar."}
+    if not text.strip():
+        return {"error": "Kein Text vorhanden."}
 
-    idx = {nodes[i]: i for i in range(n)}
-    # Initial positions
-    pos = rng.normal(0, 1, size=(n, 2)).astype(float)
+    # kurze, stabile Ausgabe als JSON erzwingen
+    prompt = (
+        "Analysiere den folgenden Filmtext (Beschreibung oder Critics Consensus) und gib NUR JSON zurück "
+        "mit den Keys: summary (max 2 Sätze), sentiment (positive|neutral|negative), topics (Liste mit 5 Stichworten).\n\n"
+        f"TEXT:\n{text.strip()}"
+    )
 
-    # Build adjacency list from edges
-    E = []
-    for u, v in edges_pairs:
-        if u in idx and v in idx and u != v:
-            E.append((idx[u], idx[v]))
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-5.2",
+                "input": prompt,
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            return {"error": f"OpenAI API Error {resp.status_code}: {resp.text[:400]}"}
 
-    # constants
-    area = 4.0
-    k = np.sqrt(area / max(n, 1))
-    temperature = 0.5
+        data = resp.json()
 
-    def cool(t, step):
-        return t * (1.0 - step / max(iters, 1))
+        # Responses API: convenience: output_text (wenn vorhanden), sonst output[] zusammensetzen
+        out_text = data.get("output_text", "")
+        if not out_text:
+            # fallback: best-effort
+            try:
+                chunks = []
+                for item in data.get("output", []):
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            chunks.append(c.get("text", ""))
+                out_text = "\n".join(chunks).strip()
+            except Exception:
+                out_text = ""
 
-    for step in range(iters):
-        disp = np.zeros((n, 2), dtype=float)
+        out_text = out_text.strip()
+        if not out_text:
+            return {"error": "Keine Ausgabe von der API erhalten."}
 
-        # Repulsive
-        for i in range(n):
-            delta = pos[i] - pos  # (n,2)
-            dist2 = (delta[:, 0] ** 2 + delta[:, 1] ** 2) + 1e-6
-            inv = (k * k) / dist2
-            # weighted sum ignoring self
-            inv[i] = 0.0
-            disp[i] += (delta * inv[:, None]).sum(axis=0)
+        # JSON parsen (falls Modell trotz Bitte noch Text drumherum packt)
+        m = re.search(r"\{.*\}", out_text, flags=re.S)
+        candidate = m.group(0) if m else out_text
+        try:
+            obj = json.loads(candidate)
+            # normalize
+            return {
+                "summary": str(obj.get("summary", "")).strip(),
+                "sentiment": str(obj.get("sentiment", "")).strip(),
+                "topics": obj.get("topics", []),
+            }
+        except Exception:
+            return {"error": "Antwort war kein gültiges JSON.", "raw": out_text[:600]}
 
-        # Attractive
-        for (a, b) in E:
-            delta = pos[a] - pos[b]
-            dist = np.sqrt(delta[0] ** 2 + delta[1] ** 2) + 1e-6
-            force = (dist * dist) / k
-            vec = delta / dist
-            disp[a] -= vec * force
-            disp[b] += vec * force
-
-        # Update positions with limited step (temperature)
-        lengths = np.sqrt((disp[:, 0] ** 2 + disp[:, 1] ** 2)) + 1e-9
-        step_vec = disp / lengths[:, None] * np.minimum(lengths, temperature)[:, None]
-        pos += step_vec
-
-        # Normalize into a reasonable window
-        pos -= pos.mean(axis=0)
-        mx = np.max(np.abs(pos)) + 1e-6
-        pos /= mx
-
-        temperature = cool(temperature, step)
-
-    return {nodes[i]: (float(pos[i, 0]), float(pos[i, 1])) for i in range(n)}
+    except Exception as e:
+        return {"error": f"Request fehlgeschlagen: {e}"}
 
 
 # ---------------- UI ----------------
@@ -521,8 +443,8 @@ app_ui = ui.page_sidebar(
                 "top20": "Top 20",
                 "gtrends": "Google Trends",
                 "rt_only": "RT (nur RT-Daten)",
-                "rt_text": "RT Textdaten",
-                "graph": "Graph (RT Netzwerk)",
+                "rt_text_ai": "RT Text + KI",
+                "graph": "Graph (RT: Movie/Actor/Genre)",
                 "table": "Tabelle",
             },
             selected="overview",
@@ -535,21 +457,26 @@ app_ui = ui.page_sidebar(
         ui.input_numeric("min_votes", "Mind. IMDb-Stimmen (Filter)", value=50000, min=0, step=1000),
         ui.input_checkbox("use_audience", "RT Audience mit anzeigen", True),
         ui.tags.hr(),
-        ui.tags.div("RT Textdaten", class_="muted"),
+        ui.tags.div("RT Text + KI", class_="muted"),
         ui.input_selectize("rt_title", "Film auswählen", choices=[], selected=None, multiple=False),
         ui.input_radio_buttons(
-            "rt_text_field",
+            "rt_text_source",
             "Textquelle",
-            choices={"movie_info": "Plot / movie_info", "critics_consensus": "Critics Consensus", "both": "Beides"},
+            choices={"movie_info": "Beschreibung (movie_info)", "critics_consensus": "Critics Consensus"},
             selected="movie_info",
             inline=False,
         ),
+        ui.input_action_button("run_ai", "KI-Analyse starten"),
+        ui.tags.div(
+            "Hinweis: OPENAI_API_KEY muss als Environment Variable gesetzt sein.",
+            class_="muted",
+            style="margin-top:6px;",
+        ),
         ui.tags.hr(),
-        ui.tags.div("Graph (RT Netzwerk)", class_="muted"),
+        ui.tags.div("Graph", class_="muted"),
         ui.input_selectize("graph_node", "Knoten auswählen", choices=[], selected=None, multiple=False),
         ui.input_numeric("graph_hops", "Hops", value=1, min=1, max=2, step=1),
-        ui.input_numeric("graph_max_edges", "Max. Edges im Plot", value=250, min=50, max=800, step=50),
-        ui.input_checkbox("graph_show_labels", "Labels anzeigen (nur Fokus + Nachbarn)", True),
+        ui.input_numeric("graph_max_nodes", "Max. Knoten (Layout)", value=80, min=20, max=200, step=10),
         ui.tags.hr(),
         ui.tags.div("Status", class_="muted"),
         ui.output_ui("status_files"),
@@ -563,27 +490,33 @@ app_ui = ui.page_sidebar(
 
 # ---------------- Server ----------------
 def server(input: Inputs, output: Outputs, session: Session):
-
-    # ---- Dropdowns nur einmal initialisieren (ohne session.user_data) ----
     dropdowns_inited = reactive.Value(False)
 
+    # Dropdowns (einmal initialisieren – ohne session.user_data)
     @reactive.Effect
     def _init_dropdowns_once():
-        if dropdowns_inited():
+        if dropdowns_inited.get():
             return
 
-        # RT titles (für Texttab)
-        if not rt_tg.empty:
-            tmp = rt_tg[["title", "title_norm"]].drop_duplicates().sort_values("title").head(9000)
-            rt_choices = {r["title_norm"]: r["title"] for _, r in tmp.iterrows()}
-            ui.update_selectize("rt_title", choices=rt_choices)
-            if rt_choices:
-                ui.update_selectize("rt_title", selected=next(iter(rt_choices.keys())))
-        else:
+        # RT Titel Dropdown
+        if rt_text.empty:
             ui.update_selectize("rt_title", choices={})
+        else:
+            tmp = rt_text.copy()
+            tmp["label"] = tmp.apply(
+                lambda r: f"{r['title']} ({int(r['year'])})" if pd.notna(r["year"]) else str(r["title"]),
+                axis=1,
+            )
+            tmp = tmp.sort_values(["title"]).head(6000)
+            choices = {r["title_norm"]: r["label"] for _, r in tmp.iterrows()}
+            ui.update_selectize("rt_title", choices=choices)
+            if input.rt_title() is None and choices:
+                ui.update_selectize("rt_title", selected=next(iter(choices.keys())))
 
-        # Graph nodes (aus edges generiert)
-        if not edges.empty:
+        # Graph Nodes Dropdown
+        if edges.empty:
+            ui.update_selectize("graph_node", choices={})
+        else:
             nodes_src = edges[["source", "source_norm", "source_type"]].rename(
                 columns={"source": "label", "source_norm": "norm", "source_type": "type"}
             )
@@ -591,17 +524,15 @@ def server(input: Inputs, output: Outputs, session: Session):
                 columns={"target": "label", "target_norm": "norm", "target_type": "type"}
             )
             nodes = pd.concat([nodes_src, nodes_tgt], ignore_index=True).drop_duplicates(subset=["norm", "type"])
-            nodes = nodes.sort_values(["type", "label"]).head(14000)
-            g_choices = {f"{r['type']}::{r['norm']}": f"{r['type']}: {r['label']}" for _, r in nodes.iterrows()}
-            ui.update_selectize("graph_node", choices=g_choices)
-            if g_choices:
-                ui.update_selectize("graph_node", selected=next(iter(g_choices.keys())))
-        else:
-            ui.update_selectize("graph_node", choices={})
+            nodes = nodes.sort_values(["type", "label"]).head(9000)
+            gchoices = {f"{r['type']}::{r['norm']}": f"{r['type']}: {r['label']}" for _, r in nodes.iterrows()}
+            ui.update_selectize("graph_node", choices=gchoices)
+            if input.graph_node() is None and gchoices:
+                ui.update_selectize("graph_node", selected=next(iter(gchoices.keys())))
 
         dropdowns_inited.set(True)
 
-    # ---------------- Status ----------------
+    # Status / Quelle anzeigen
     @output
     @render.ui
     def status_files():
@@ -614,16 +545,17 @@ def server(input: Inputs, output: Outputs, session: Session):
             li(CSV_RT_RAW is not None, f"rt_raw: {CSV_RT_RAW} (shape={tuple(rt_raw.shape)})"),
             li(CSV_TOP20 is not None, f"top20 : {CSV_TOP20}  (shape={tuple(top20_raw.shape)})"),
             li(CSV_GTR is not None, f"gtr   : {CSV_GTR}    (shape={tuple(gtr_raw.shape)})"),
-            ui.tags.li(f"RT-Quelle (Ratings): {RT_SOURCE}"),
-            ui.tags.li(f"RT Ratings (≤2020): {len(rt_std):,}".replace(",", ".")),
+            ui.tags.li(f"RT-Quelle aktiv (Scores): {RT_SOURCE}"),
+            ui.tags.li(f"RT-Scores Datensätze (≤2020): {len(rt_std):,}".replace(",", ".")),
             ui.tags.li("—"),
-            ui.tags.li(f"RT Text/Graph Titles: {len(rt_tg):,}".replace(",", ".")),
+            ui.tags.li(f"RT Textdatensätze: {len(rt_text):,}".replace(",", ".")),
             ui.tags.li(f"Edges (aus RT erzeugt): {len(edges):,}".replace(",", ".")),
-            ui.tags.li(f"networkx verfügbar: {'ja' if HAS_NX else 'nein (Fallback spring layout in numpy)'}"),
+            ui.tags.li(f"networkx verfügbar: {'ja' if HAS_NX else 'nein (Fallback)'}"),
+            ui.tags.li(f"requests verfügbar: {'ja' if HAS_REQUESTS else 'nein (OpenAI Call deaktiviert)'}"),
         ]
         return ui.tags.small(ui.tags.ul(*rows, style="margin:0;padding-left:18px;"))
 
-    # ---------------- Data Views (Ratings) ----------------
+    # Daten-Sichten
     @reactive.Calc
     def df_joined():
         df = joined_for_visuals().copy()
@@ -644,80 +576,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         col = "RT_Tomatometer"
         return d[d[col].notna()] if not d.empty and col in d.columns else d.iloc[0:0]
 
-    @reactive.Calc
-    def df_without_rt():
-        d = df_joined()
-        col = "RT_Tomatometer"
-        return d[d[col].isna()] if not d.empty and col in d.columns else d
-
-    # ---------------- Texttab: ausgewählter Film ----------------
-    @reactive.Calc
-    def rt_selected_row() -> pd.Series:
-        key = input.rt_title()
-        if rt_tg.empty or key is None:
-            return pd.Series({"title": "", "title_norm": "", "movie_info": "", "critics_consensus": ""})
-        hit = rt_tg[rt_tg["title_norm"] == str(key)]
-        if hit.empty:
-            return pd.Series({"title": "", "title_norm": str(key), "movie_info": "", "critics_consensus": ""})
-        return hit.iloc[0]
-
-    def rt_text_for_analysis(row: pd.Series) -> str:
-        mode = str(input.rt_text_field())
-        info = str(row.get("movie_info", "") or "")
-        cons = str(row.get("critics_consensus", "") or "")
-        if mode == "movie_info":
-            return info
-        if mode == "critics_consensus":
-            return cons
-        return (info.strip() + "\n\n" + cons.strip()).strip()
-
-    # ---------------- Graphtab: Auswahl + Subgraph ----------------
-    @reactive.Calc
-    def graph_selected() -> Tuple[str, str]:
-        k = input.graph_node()
-        if not k or "::" not in str(k):
-            return ("", "")
-        t, n = str(k).split("::", 1)
-        return (t.strip(), n.strip())
-
-    @reactive.Calc
-    def graph_sub_edges() -> pd.DataFrame:
-        if edges.empty:
-            return edges.iloc[0:0]
-
-        node_type, node_norm = graph_selected()
-        if not node_type or not node_norm:
-            return edges.iloc[0:0]
-
-        hops = int(input.graph_hops())
-        hops = 1 if hops < 1 else (2 if hops > 2 else hops)
-
-        sub = edges[
-            ((edges["source_type"] == node_type) & (edges["source_norm"] == node_norm))
-            | ((edges["target_type"] == node_type) & (edges["target_norm"] == node_norm))
-        ].copy()
-
-        if hops == 1:
-            return sub.head(int(input.graph_max_edges()))
-
-        neigh: set[Tuple[str, str]] = set()
-        for _, r in sub.iterrows():
-            if r["source_type"] == node_type and r["source_norm"] == node_norm:
-                neigh.add((r["target_type"], r["target_norm"]))
-            if r["target_type"] == node_type and r["target_norm"] == node_norm:
-                neigh.add((r["source_type"], r["source_norm"]))
-
-        mask = pd.Series(False, index=edges.index)
-        for (t, n) in neigh:
-            mask = mask | (
-                ((edges["source_type"] == t) & (edges["source_norm"] == n))
-                | ((edges["target_type"] == t) & (edges["target_norm"] == n))
-            )
-
-        sub2 = edges[mask].copy()
-        out = pd.concat([sub, sub2], ignore_index=True).drop_duplicates()
-        return out.head(int(input.graph_max_edges()))
-
     # ---------------- Titel ----------------
     @output
     @render.ui
@@ -726,12 +584,12 @@ def server(input: Inputs, output: Outputs, session: Session):
             "overview": "Übersicht",
             "compare": "Vergleich IMDb ↔ Rotten Tomatoes",
             "coverage": "Abdeckung Rotten Tomatoes",
-            "trends": "Trends (IMDb)",
+            "trends": "Trends (Genre & दशकहnt)",
             "top20": "Top 20 (IMDb-Stimmen)",
             "gtrends": "Google Trends",
             "rt_only": "Rotten Tomatoes — eigene Sicht",
-            "rt_text": "Rotten Tomatoes — Textdaten (Plot/Consensus)",
-            "graph": "Graph — Netzplan (Movie / Actor / Genre ...)",
+            "rt_text_ai": "Rotten Tomatoes — Textdaten + KI",
+            "graph": "Graph — Movie / Actor / Genre (aus RT gebaut)",
             "table": "Tabelle (gefiltert)",
         }
         return ui.tags.h3(mapping.get(input.page(), "Übersicht"))
@@ -755,10 +613,20 @@ def server(input: Inputs, output: Outputs, session: Session):
             return ui.div(ui.output_plot("p_gtrends"), ui.output_data_frame("tbl_gtrends"))
         if p == "rt_only":
             return ui.div(ui.output_plot("p_rt_only_avg"))
-        if p == "rt_text":
-            return ui.div(ui.output_ui("rt_text_block"), ui.output_data_frame("tbl_rt_terms"))
+        if p == "rt_text_ai":
+            return ui.div(
+                ui.output_ui("rt_text_block"),
+                ui.layout_column_wrap(
+                    ui.card(ui.card_header("Top-Wörter (einfach)"), ui.output_data_frame("tbl_rt_terms")),
+                    ui.card(ui.card_header("KI-Ergebnis (OpenAI)"), ui.output_ui("ai_result_block")),
+                    fill=False,
+                ),
+            )
         if p == "graph":
-            return ui.div(ui.output_plot("p_graph_edges"), ui.output_data_frame("tbl_graph_edges"))
+            return ui.div(
+                ui.card(ui.card_header("Netzplan (Subgraph)"), ui.output_plot("p_graph_nice")),
+                ui.card(ui.card_header("Edge-Liste (Subgraph)"), ui.output_data_frame("tbl_graph_edges")),
+            )
         if p == "table":
             return ui.div(ui.output_data_frame("tbl_all"))
         return ui.div("—")
@@ -768,15 +636,20 @@ def server(input: Inputs, output: Outputs, session: Session):
         d_all = df_joined()
         d_rt = df_with_rt()
         cards = []
-        cards.append(ui.value_box(title="Filme (gefiltert)", value=f"{len(d_all):,}".replace(",", ".")))
-        if "IMDb_Score_100" in d_all and d_all["IMDb_Score_100"].notna().any():
-            cards.append(ui.value_box(title="Ø IMDb (0–100)", value=f"{d_all['IMDb_Score_100'].mean():.1f}"))
-        if not d_rt.empty and d_rt["RT_Tomatometer"].notna().any():
-            cards.append(ui.value_box(title="Ø RT Tomatometer", value=f"{d_rt['RT_Tomatometer'].mean():.1f}"))
-        if input.use_audience() and not d_rt.empty and "RT_Audience" in d_rt and d_rt["RT_Audience"].notna().any():
-            cards.append(ui.value_box(title="Ø RT Audience", value=f"{d_rt['RT_Audience'].mean():.1f}"))
+        def vb(title, value): return ui.value_box(title=title, value=value)
+
+        cards.append(vb("Filme (gefiltert)", f"{len(d_all):,}".replace(",", ".")))
+        if "IMDb_Score_100" in d_all:
+            imdb_mean = d_all["IMDb_Score_100"].dropna().mean()
+            cards.append(vb("Ø IMDb (0–100)", f"{imdb_mean:.1f}" if not pd.isna(imdb_mean) else "—"))
+        if not d_rt.empty:
+            rt_mean = d_rt["RT_Tomatometer"].dropna().mean()
+            cards.append(vb("Ø RT Tomatometer", f"{rt_mean:.1f}"))
+            if input.use_audience() and "RT_Audience" in d_rt:
+                aud_mean = d_rt["RT_Audience"].dropna().mean()
+                cards.append(vb("Ø RT Audience", f"{aud_mean:.1f}" if not pd.isna(aud_mean) else "—"))
         share = (len(d_rt) / len(d_all) * 100) if len(d_all) > 0 else 0
-        cards.append(ui.value_box(title="RT-Abdeckung", value=f"{share:.1f}%"))
+        cards.append(vb("RT-Abdeckung", f"{share:.1f}%"))
         return ui.layout_column_wrap(*cards, fill=False)
 
     # ---------------- Übersicht: Balken + CCDF ----------------
@@ -800,7 +673,9 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off")
             ax.text(0.5, 0.5, "Keine Daten", ha="center", va="center")
             return fig
-        ax.bar(labels, values)
+
+        colors = ["#2563EB", "#F59E0B", "#10B981"][: len(values)]
+        ax.bar(labels, values, color=colors)
         for i, v in enumerate(values):
             ax.text(i, v + 1, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
         ax.set_ylim(0, 100)
@@ -824,7 +699,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             return fig
         xs = np.sort(x)
         ys = np.arange(1, xs.size + 1) / xs.size
-        ax.plot(xs, 1 - ys, linewidth=2)
+        ax.plot(xs, 1 - ys, color="#2563EB", linewidth=2)
         ax.set_xlabel("log10(Stimmen)  (3=1.000, 4=10.000, 5=100.000)")
         ax.set_ylabel("Anteil der Filme ≥ X")
         ax.set_title(f"Wie viele Stimmen haben die Filme? (N={x.size:,})".replace(",", "."))
@@ -841,8 +716,8 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off")
             ax.text(0.5, 0.5, "Keine Schnittmenge (IMDb & RT)", ha="center", va="center")
             return fig
-        ax.scatter(d["IMDb_Score_100"], d["RT_Tomatometer"], s=10, alpha=0.4)
-        ax.plot([0, 100], [0, 100], linestyle="--", linewidth=1.5, alpha=0.9)
+        ax.scatter(d["IMDb_Score_100"], d["RT_Tomatometer"], s=10, alpha=0.4, color="#4F46E5")
+        ax.plot([0, 100], [0, 100], linestyle="--", linewidth=1.5, color="#F59E0B", alpha=0.9)
         ax.set_xlim(0, 100)
         ax.set_ylim(0, 100)
         ax.set_xlabel("IMDb (0–100)")
@@ -862,8 +737,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         d = d.copy()
         d["bin"] = (d["IMDb_Score_100"] // 10 * 10).astype(int).clip(0, 90)
         s = d.groupby("bin").apply(lambda x: (x["RT_Tomatometer"] - x["IMDb_Score_100"]).mean())
-        ax.plot(s.index, s.values, marker="o", linewidth=2)
-        ax.axhline(0, linewidth=1)
+        ax.plot(s.index, s.values, marker="o", color="#EF4444", linewidth=2)
+        ax.axhline(0, color="#111827", linewidth=1)
         ax.set_xticks(list(range(0, 101, 10)))
         ax.set_xlabel("IMDb (gerundet, 0–100)")
         ax.set_ylabel("Ø [RT − IMDb] (Punkte)")
@@ -887,7 +762,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off")
             ax.text(0.5, 0.5, "Keine Jahresdaten", ha="center", va="center")
             return fig
-        ax.plot(share.index, share.values, marker="o", linewidth=2)
+        ax.plot(share.index, share.values, marker="o", color="#2563EB", linewidth=2)
         ax.set_ylim(0, 100)
         ax.set_xlabel("Jahr")
         ax.set_ylabel("RT-Abdeckung (%)")
@@ -909,11 +784,13 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off")
             ax.text(0.5, 0.5, "Keine RT-Werte", ha="center", va="center")
             return fig
+        colors = ["#10B981", "#EF4444"]
         ax.pie(
             counts.values,
             labels=[f"{k} ({int(v)})" for k, v in counts.items()],
             autopct="%1.0f%%",
             startangle=90,
+            colors=colors,
             textprops={"fontsize": 11},
         )
         ax.set_title("RT-Verteilung (Fresh ≥ 60)")
@@ -942,7 +819,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             return fig
         s = g.groupby("genre").agg(avg=("IMDb_Score_100", "mean"), n=("IMDb_Score_100", "size"))
         s = s.sort_values("avg", ascending=False).head(12)
-        ax.bar(s.index, s["avg"])
+        ax.bar(s.index, s["avg"], color="#2563EB")
         for i, (v, n) in enumerate(zip(s["avg"], s["n"])):
             ax.text(i, v + 1, f"{v:.1f}\nN={n}", ha="center", fontsize=8)
         ax.set_ylim(0, 100)
@@ -963,7 +840,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         dec = d.dropna(subset=["year"]).copy()
         dec["decade"] = (dec["year"].astype(int) // 10) * 10
         s = dec.groupby("decade").agg(avg=("IMDb_Score_100", "mean"), n=("IMDb_Score_100", "size")).sort_index()
-        ax.plot(s.index, s["avg"], marker="o", linewidth=2)
+        ax.plot(s.index, s["avg"], marker="o", color="#F59E0B", linewidth=2)
         for x, y, n in zip(s.index, s["avg"], s["n"]):
             ax.text(x, y + 1, f"{y:.1f}\nN={n}", ha="center", fontsize=8)
         ax.set_ylim(0, 100)
@@ -985,7 +862,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             return fig
         d = d.sort_values("numVotes", ascending=True).tail(20)
         labels = d["title"].astype(str) + " (" + d["year"].astype(int).astype(str) + ")"
-        ax.barh(labels, d["numVotes"].values)
+        ax.barh(labels, d["numVotes"].values, color="#2563EB")
         ax.set_xlabel("Stimmen (IMDb)")
         ax.set_title("Top 20 nach IMDb-Stimmen")
         return fig
@@ -1060,18 +937,20 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.axis("off")
             ax.text(0.5, 0.5, "Keine RT-Daten", ha="center", va="center")
             return fig
-        labels, values = [], []
+        labels, values, colors = [], [], []
         if d["rt_tomato"].notna().any():
             labels.append(f"Tomatometer\nN={d['rt_tomato'].notna().sum():,}".replace(",", "."))
             values.append(d["rt_tomato"].mean())
+            colors.append("#F59E0B")
         if input.use_audience() and d["rt_audience"].notna().any():
             labels.append(f"Audience\nN={d['rt_audience'].notna().sum():,}".replace(",", "."))
             values.append(d["rt_audience"].mean())
+            colors.append("#10B981")
         if not values:
             ax.axis("off")
             ax.text(0.5, 0.5, "Keine RT-Werte", ha="center", va="center")
             return fig
-        ax.bar(labels, values)
+        ax.bar(labels, values, color=colors)
         for i, v in enumerate(values):
             ax.text(i, v + 1, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
         ax.set_ylim(0, 100)
@@ -1079,22 +958,37 @@ def server(input: Inputs, output: Outputs, session: Session):
         ax.set_ylabel("Punkte")
         return fig
 
-    # ---------------- RT Text Outputs ----------------
+    # ---------------- RT Text + KI ----------------
+    @reactive.Calc
+    def rt_selected_row() -> pd.Series:
+        key = input.rt_title()
+        if rt_text.empty or key is None:
+            return pd.Series({"title": "", "title_norm": "", "year": pd.NA, "movie_info": "", "critics_consensus": "", "genres": "", "actors": ""})
+        hit = rt_text[rt_text["title_norm"] == str(key)]
+        if hit.empty:
+            return pd.Series({"title": "", "title_norm": str(key), "year": pd.NA, "movie_info": "", "critics_consensus": "", "genres": "", "actors": ""})
+        # falls mehrere Jahre: nimm das erste (oder man könnte hier später per Jahr auswählen)
+        return hit.iloc[0]
+
     @output
     @render.ui
     def rt_text_block():
-        row = rt_selected_row()
-        title = str(row.get("title", "")) or "—"
-        txt = rt_text_for_analysis(row)
+        r = rt_selected_row()
+        title = str(r.get("title", "")) or "—"
+        year = r.get("year", pd.NA)
+        ytxt = f"({int(year)})" if pd.notna(year) else ""
+        src = input.rt_text_source()
+        txt = str(r.get(src, "") or "")
         meta = []
-        g = str(row.get("genres", "") or "")
-        if g.strip():
-            meta.append(f"Genres: {g}")
+        meta.append(f"Quelle: {src}")
+        meta.append(f"Textlänge: {len(txt):,} Zeichen".replace(",", "."))
+        meta.append(f"Genres: {', '.join(split_list(r.get('genres',''))[:8])}".strip())
+        meta.append(f"Actors: {', '.join(split_list(r.get('actors',''))[:6])}".strip())
         return ui.card(
-            ui.card_header(f"📄 Textdaten: {title}"),
-            ui.tags.div(" · ".join(meta), class_="muted", style="margin-bottom:8px;"),
+            ui.card_header(f"📄 {title} {ytxt}"),
+            ui.tags.div(" · ".join([m for m in meta if m]), class_="muted", style="margin-bottom:8px;"),
             ui.tags.pre(
-                textwrap.fill(txt, width=110) if txt else "Kein Text in RT vorhanden.",
+                textwrap.fill(txt, width=110) if txt else "Kein Text in rotten_tomatoes_movies.csv gefunden.",
                 style="white-space:pre-wrap;margin:0;",
             ),
         )
@@ -1102,25 +996,118 @@ def server(input: Inputs, output: Outputs, session: Session):
     @output
     @render.data_frame
     def tbl_rt_terms():
-        row = rt_selected_row()
-        txt = rt_text_for_analysis(row)
+        r = rt_selected_row()
+        src = input.rt_text_source()
+        txt = str(r.get(src, "") or "")
         if not txt.strip():
             return pd.DataFrame(columns=["Wort", "Häufigkeit"])
+
         stop = set(
             """
-            the a an and or of to in on for with as is are was were be been being at by from this that it its
-            der die das ein eine und oder zu im in auf für mit als ist sind war waren sein
-            """
-            .split()
+        the a an and or of to in on for with as is are was were be been being at by from this that it its
+        der die das ein eine und oder zu im in auf für mit als ist sind war waren sein
+        """.split()
         )
         words = re.findall(r"[A-Za-zÄÖÜäöüß']{3,}", txt.lower())
         words = [w for w in words if w not in stop]
         if not words:
             return pd.DataFrame(columns=["Wort", "Häufigkeit"])
-        s = pd.Series(words).value_counts().head(25)
+        s = pd.Series(words).value_counts().head(20)
         return pd.DataFrame({"Wort": s.index, "Häufigkeit": s.values})
 
-    # ---------------- Graph Outputs ----------------
+    # KI Trigger + Result Cache
+    ai_state = reactive.Value({"note": "Noch keine Analyse gestartet."})
+
+    @reactive.Effect
+    @reactive.event(input.run_ai)
+    def _run_ai():
+        r = rt_selected_row()
+        src = input.rt_text_source()
+        txt = str(r.get(src, "") or "")
+        res = openai_analyze_text(txt)
+        ai_state.set(res)
+
+    @output
+    @render.ui
+    def ai_result_block():
+        res = ai_state.get()
+        if not isinstance(res, dict):
+            return ui.tags.div("—")
+
+        if "error" in res:
+            raw = res.get("raw", "")
+            return ui.card(
+                ui.card_header("⚠️ KI-Analyse"),
+                ui.tags.div(res["error"], style="margin-bottom:8px;"),
+                ui.tags.pre(raw, style="white-space:pre-wrap;") if raw else ui.tags.div(),
+            )
+
+        topics = res.get("topics", [])
+        if isinstance(topics, str):
+            topics = [topics]
+        if isinstance(topics, list):
+            topics_txt = ", ".join([str(x) for x in topics if str(x).strip()])
+        else:
+            topics_txt = ""
+
+        return ui.card(
+            ui.card_header("🤖 KI-Analyse (OpenAI)"),
+            ui.tags.div(f"Sentiment: {res.get('sentiment','—')}", style="margin-bottom:6px;"),
+            ui.tags.div("Themen: " + (topics_txt or "—"), style="margin-bottom:10px;"),
+            ui.tags.pre(
+                textwrap.fill(str(res.get("summary", "") or "—"), width=110),
+                style="white-space:pre-wrap;margin:0;",
+            ),
+        )
+
+    # ---------------- Graph (Subgraph + schöner Netzplan) ----------------
+    @reactive.Calc
+    def graph_selected() -> tuple[str, str]:
+        k = input.graph_node()
+        if not k or "::" not in str(k):
+            return ("", "")
+        t, n = str(k).split("::", 1)
+        return (t.strip(), n.strip())
+
+    @reactive.Calc
+    def graph_sub_edges() -> pd.DataFrame:
+        if edges.empty:
+            return edges.iloc[0:0]
+
+        node_type, node_norm = graph_selected()
+        if not node_type or not node_norm:
+            return edges.iloc[0:0]
+
+        hops = int(input.graph_hops())
+        hops = 1 if hops < 1 else (2 if hops > 2 else hops)
+
+        sub = edges[
+            ((edges["source_type"] == node_type) & (edges["source_norm"] == node_norm))
+            | ((edges["target_type"] == node_type) & (edges["target_norm"] == node_norm))
+        ].copy()
+
+        if hops == 1:
+            return sub.head(800)
+
+        # 2-hop
+        neigh: set[tuple[str, str]] = set()
+        for _, r in sub.iterrows():
+            if r["source_type"] == node_type and r["source_norm"] == node_norm:
+                neigh.add((r["target_type"], r["target_norm"]))
+            if r["target_type"] == node_type and r["target_norm"] == node_norm:
+                neigh.add((r["source_type"], r["source_norm"]))
+
+        mask = pd.Series(False, index=edges.index)
+        for (t, n) in neigh:
+            mask = mask | (
+                ((edges["source_type"] == t) & (edges["source_norm"] == n))
+                | ((edges["target_type"] == t) & (edges["target_norm"] == n))
+            )
+
+        sub2 = edges[mask].copy()
+        out = pd.concat([sub, sub2], ignore_index=True).drop_duplicates()
+        return out.head(1200)
+
     @output
     @render.data_frame
     def tbl_graph_edges():
@@ -1129,145 +1116,93 @@ def server(input: Inputs, output: Outputs, session: Session):
             return pd.DataFrame(columns=["Quelle", "Relation", "Ziel", "Quelle_Typ", "Ziel_Typ"])
         show = d[["source", "relation", "target", "source_type", "target_type"]].copy()
         show.columns = ["Quelle", "Relation", "Ziel", "Quelle_Typ", "Ziel_Typ"]
-        return show.head(int(input.graph_max_edges()))
+        return show.head(400)
 
     @output
     @render.plot
-    def p_graph_edges():
-        fig, ax = plt.subplots(figsize=(9, 5))
+    def p_graph_nice():
+        fig, ax = plt.subplots(figsize=(10, 6))
         d = graph_sub_edges()
+
         if d.empty:
             ax.axis("off")
-            ax.text(0.5, 0.5, "Keine Edges für die aktuelle Auswahl.", ha="center", va="center")
+            ax.text(0.5, 0.5, "Keine Graphdaten für die aktuelle Auswahl.", ha="center", va="center")
             return fig
 
         node_type, node_norm = graph_selected()
+        max_nodes = int(input.graph_max_nodes())
 
-        # Build node keys
-        def node_key(t: str, label: str) -> str:
-            return f"{t}:{label}"
+        if not HAS_NX:
+            ax.axis("off")
+            lines = []
+            for _, r in d.head(25).iterrows():
+                lines.append(f"{r['source_type']}:{r['source']} --{r['relation']}--> {r['target_type']}:{r['target']}")
+            ax.text(0.01, 0.99, "\n".join(lines), ha="left", va="top", family="monospace", fontsize=9)
+            ax.set_title("Graph-Fallback (erste 25 Kanten)")
+            return fig
 
-        # Limit for readability
-        d = d.head(int(input.graph_max_edges())).copy()
-
-        # Build edge list (for plotting)
-        edge_pairs: List[Tuple[str, str]] = []
-        node_types: Dict[str, str] = {}
-
+        # NetworkX Graph bauen
+        G = nx.Graph()
         for _, r in d.iterrows():
-            s = node_key(r["source_type"], r["source"])
-            t = node_key(r["target_type"], r["target"])
-            edge_pairs.append((s, t))
-            node_types[s] = str(r["source_type"])
-            node_types[t] = str(r["target_type"])
+            s_id = f"{r['source_type']}::{r['source_norm']}"
+            t_id = f"{r['target_type']}::{r['target_norm']}"
+            # label separat speichern (Originalname)
+            G.add_node(s_id, label=str(r["source"]), ntype=str(r["source_type"]))
+            G.add_node(t_id, label=str(r["target"]), ntype=str(r["target_type"]))
+            G.add_edge(s_id, t_id, relation=str(r["relation"]))
 
-        nodes = sorted(set([u for u, _ in edge_pairs] + [v for _, v in edge_pairs]))
+        # Fokusnode
+        focus = f"{node_type}::{node_norm}"
+        if focus not in G:
+            focus = list(G.nodes)[0]
 
-        # Find focus key (best effort)
-        focus = None
-        for _, r in d.iterrows():
-            if r["source_type"] == node_type and norm_title(r["source"]) == node_norm:
-                focus = node_key(r["source_type"], r["source"])
-                break
-            if r["target_type"] == node_type and norm_title(r["target"]) == node_norm:
-                focus = node_key(r["target_type"], r["target"])
-                break
-
-        # Degree (for sizing)
-        deg = {n: 0 for n in nodes}
-        for u, v in edge_pairs:
-            if u in deg:
-                deg[u] += 1
-            if v in deg:
-                deg[v] += 1
-
-        # Colors per type (legend)
-        type_palette = {
-            "movie": "#2563EB",
-            "actor": "#10B981",
-            "genre": "#F59E0B",
-            "director": "#8B5CF6",
-            "author": "#EF4444",
-        }
-
-        def color_for(n: str) -> str:
-            t = node_types.get(n, "")
-            return type_palette.get(t, "#64748B")
+        # wenn zu groß: auf ego-graph + degree-cut reduzieren
+        if G.number_of_nodes() > max_nodes:
+            # erst ego um Fokus
+            ego = nx.ego_graph(G, focus, radius=int(input.graph_hops()))
+            # dann nach degree (wichtige Knoten behalten)
+            deg = dict(ego.degree())
+            keep = sorted(deg.keys(), key=lambda k: deg[k], reverse=True)[:max_nodes]
+            G = ego.subgraph(keep).copy()
 
         # Layout
-        if HAS_NX:
-            G = nx.Graph()
-            for u, v in edge_pairs:
-                G.add_edge(u, v)
-            try:
-                pos = nx.spring_layout(G, seed=42, k=0.9)
-            except Exception:
-                pos = nx.random_layout(G, seed=42)
-            pos_dict = {n: (float(pos[n][0]), float(pos[n][1])) for n in G.nodes}
-        else:
-            pos_dict = spring_layout_numpy(nodes, edge_pairs, seed=42, iters=260)
+        try:
+            pos = nx.spring_layout(G, seed=42, k=0.9, iterations=80)
+        except Exception:
+            pos = nx.random_layout(G, seed=42)
 
-        # Draw edges
-        for u, v in edge_pairs:
-            if u not in pos_dict or v not in pos_dict:
-                continue
-            x1, y1 = pos_dict[u]
-            x2, y2 = pos_dict[v]
-            ax.plot([x1, x2], [y1, y2], alpha=0.25, linewidth=1.1, color="#111827")
+        # Styling: Farben pro Typ + Node size nach Degree
+        type_color = {"movie": "#2563EB", "actor": "#10B981", "genre": "#F59E0B"}
+        degrees = dict(G.degree())
+        sizes = [220 + 70 * min(degrees.get(n, 1), 10) for n in G.nodes]
+        node_colors = [type_color.get(G.nodes[n].get("ntype", ""), "#94A3B8") for n in G.nodes]
 
-        # Draw nodes by type (so we can show a clean legend)
-        nodes_by_type: Dict[str, List[str]] = {}
-        for n in nodes:
-            t = node_types.get(n, "other")
-            nodes_by_type.setdefault(t, []).append(n)
+        # Edges
+        nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.25, width=1.2)
 
-        for t, ns in nodes_by_type.items():
-            xs = [pos_dict[n][0] for n in ns if n in pos_dict]
-            ys = [pos_dict[n][1] for n in ns if n in pos_dict]
-            sizes = [60 + min(deg.get(n, 0), 25) * 9 for n in ns if n in pos_dict]
-            ax.scatter(xs, ys, s=sizes, alpha=0.92, c=type_palette.get(t, "#64748B"), label=t)
+        # Nodes
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_size=sizes, node_color=node_colors, linewidths=0.8, edgecolors="#0f172a")
 
-        # Highlight focus
-        if focus and focus in pos_dict:
-            fx, fy = pos_dict[focus]
-            ax.scatter([fx], [fy], s=420, alpha=0.15, c="#0F172A")
-            ax.scatter([fx], [fy], s=160, alpha=1.0, c="#0F172A")
+        # Labels: Fokus + wichtigste Nachbarn + Top-degree
+        labels = {}
+        if focus in G:
+            labels[focus] = G.nodes[focus].get("label", "focus")
+            # Nachbarn des Fokus
+            for nb in list(G.neighbors(focus))[:18]:
+                labels[nb] = G.nodes[nb].get("label", "")
+        # Top-degree ergänzen
+        top_nodes = sorted(G.nodes, key=lambda n: degrees.get(n, 0), reverse=True)[:10]
+        for n in top_nodes:
+            labels.setdefault(n, G.nodes[n].get("label", ""))
 
-        # Labels (nur Fokus + Nachbarn)
-        show_labels = bool(input.graph_show_labels())
-        if show_labels and focus and focus in pos_dict:
-            # neighbors
-            neigh = set()
-            for u, v in edge_pairs:
-                if u == focus:
-                    neigh.add(v)
-                elif v == focus:
-                    neigh.add(u)
+        # Labels zeichnen
+        nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=8)
 
-            label_nodes = [focus] + list(neigh)[:18]
-            for n in label_nodes:
-                if n not in pos_dict:
-                    continue
-                x, y = pos_dict[n]
-                # label = nur rechter Teil nach "type:"
-                if ":" in n:
-                    t, raw = n.split(":", 1)
-                    lab = f"{t}: {_short_label(raw, 18)}"
-                else:
-                    lab = _short_label(n, 20)
-                ax.text(x, y, lab, fontsize=8, ha="center", va="center", color="#0F172A")
+        # Legende manuell (klein)
+        ax.text(0.01, 0.01, "movie / actor / genre", transform=ax.transAxes, fontsize=9, alpha=0.7)
 
-        ax.set_title(
-            f"Netzplan (Hops={int(input.graph_hops())}) — Nodes={len(nodes)}  Edges={len(edge_pairs)}"
-            + ("  [networkx]" if HAS_NX else "  [numpy-layout]")
-        )
+        ax.set_title(f"Netzplan (aus RT gebaut) — Nodes={G.number_of_nodes()}  Edges={G.number_of_edges()}  | Fokus: {labels.get(focus,'')}")
         ax.axis("off")
-        ax.set_aspect("equal", adjustable="datalim")
-
-        # Legend (nur wenn nicht zu viele Kategorien)
-        if len(nodes_by_type) <= 6:
-            ax.legend(loc="upper right", fontsize=8, frameon=True)
-
         return fig
 
 
