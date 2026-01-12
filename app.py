@@ -1,7 +1,7 @@
 # app.py — Movie Ratings Dashboard (+ RT-Text, Graph & OpenAI-Analyse)
 from __future__ import annotations
 
-import os, re, json, logging, warnings, textwrap
+import os, re, json, logging, warnings, textwrap, time
 from pathlib import Path
 
 import numpy as np
@@ -101,7 +101,6 @@ def split_list(x) -> list[str]:
         return []
     parts = [p.strip() for p in s.split(",")]
     parts = [p for p in parts if p]
-    # kleine Normalisierung (Doppelleerzeichen etc.)
     parts = [" ".join(p.split()) for p in parts]
     return parts
 
@@ -151,7 +150,6 @@ def std_rt_from_raw(df: pd.DataFrame) -> pd.DataFrame:
             .astype(float)
         )
 
-    # RT bis 2020 (für Score-Join – Text/Graph darf trotzdem alle Jahre haben)
     d = d[d["year"].fillna(0) <= 2020]
 
     d["rt_tomato"] = d.get("rt_tomato_raw", pd.Series(index=d.index)).map(to100)
@@ -171,7 +169,7 @@ def std_rt_from_metrics(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["title_norm"] = d["title_norm"].astype(str).map(norm_title)
     d["year"] = pd.to_numeric(d["year"], errors="coerce")
-    d = d[d["year"].fillna(0) <= 2020]  # RT bis 2020
+    d = d[d["year"].fillna(0) <= 2020]
     d["rt_tomato"] = pd.to_numeric(d["rt_tomato"], errors="coerce").clip(0, 100)
     d["rt_audience"] = pd.to_numeric(d["rt_audience"], errors="coerce").clip(0, 100)
     return (
@@ -198,13 +196,11 @@ def joined_for_visuals() -> pd.DataFrame:
         return joined_raw
     df = joined_raw.copy()
 
-    # einheitliche Namen
     if "year" not in df.columns and "Year" in df.columns:
         df.rename(columns={"Year": "year"}, inplace=True)
     if "numVotes" not in df.columns and "votes" in df.columns:
         df.rename(columns={"votes": "numVotes"}, inplace=True)
 
-    # merge RT (nur bis 2020, das macht rt_std bereits)
     cols = ["title_norm", "year"]
     if "year" in df:
         df["year"] = pd.to_numeric(df["year"], errors="coerce")
@@ -213,7 +209,6 @@ def joined_for_visuals() -> pd.DataFrame:
         df["rt_tomato"] = df.get("rt_tomato", pd.Series(index=df.index)).fillna(df.get("rt_tomato_rtstd"))
         df["rt_audience"] = df.get("rt_audience", pd.Series(index=df.index)).fillna(df.get("rt_audience_rtstd"))
 
-    # UI-Spalten
     if "averageRating" in df:
         df["IMDb_Score_100"] = (df["averageRating"] * 10).clip(0, 100)
     if "rt_tomato" in df:
@@ -310,21 +305,18 @@ def build_edges_from_rt(rt_df: pd.DataFrame) -> pd.DataFrame:
         genres = split_list(r.get("genres", ""))
         actors = split_list(r.get("actors", ""))
 
-        # Movie -> Genre
         for g in genres:
             gn = norm_title(g)
             if not gn:
                 continue
             rows.append((title, g, "has_genre", "movie", "genre", tn, gn))
 
-        # Movie -> Actor
         for a in actors:
             an = norm_title(a)
             if not an:
                 continue
             rows.append((title, a, "has_actor", "movie", "actor", tn, an))
 
-        # Actor -> Genre (aus demselben Film abgeleitet)
         for a in actors:
             an = norm_title(a)
             if not an:
@@ -342,80 +334,17 @@ def build_edges_from_rt(rt_df: pd.DataFrame) -> pd.DataFrame:
 
 edges = build_edges_from_rt(rt_text)
 
-# ---------------- OpenAI: Textanalyse Funktion ----------------
-def openai_analyze_text(text: str) -> dict:
+# ---------------- OpenAI low-level call + Debug state ----------------
+def openai_call_json(prompt: str, model: str = "gpt-4o-mini") -> tuple[int, str]:
     """
-    Nutzt Responses API (empfohlen) über HTTP.
-    Erwartet OPENAI_API_KEY als Environment Variable.
-    Gibt dict mit summary/sentiment/topics zurück.
+    Raw HTTP call to OpenAI Responses API.
+    Returns (status_code, response_text).
     """
     key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
-        return {"error": "OPENAI_API_KEY ist nicht gesetzt (Environment Variable fehlt)."}
-    if not HAS_REQUESTS:
-        return {"error": "Python-Paket 'requests' ist nicht verfügbar."}
-    if not text.strip():
-        return {"error": "Kein Text vorhanden."}
-
-    # kurze, stabile Ausgabe als JSON erzwingen
-    prompt = (
-        "Analysiere den folgenden Filmtext (Beschreibung oder Critics Consensus) und gib NUR JSON zurück "
-        "mit den Keys: summary (max 2 Sätze), sentiment (positive|neutral|negative), topics (Liste mit 5 Stichworten).\n\n"
-        f"TEXT:\n{text.strip()}"
-    )
-
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-5.2",
-                "input": prompt,
-            },
-            timeout=30,
-        )
-        if resp.status_code >= 400:
-            return {"error": f"OpenAI API Error {resp.status_code}: {resp.text[:400]}"}
-
-        data = resp.json()
-
-        # Responses API: convenience: output_text (wenn vorhanden), sonst output[] zusammensetzen
-        out_text = data.get("output_text", "")
-        if not out_text:
-            # fallback: best-effort
-            try:
-                chunks = []
-                for item in data.get("output", []):
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_text":
-                            chunks.append(c.get("text", ""))
-                out_text = "\n".join(chunks).strip()
-            except Exception:
-                out_text = ""
-
-        out_text = out_text.strip()
-        if not out_text:
-            return {"error": "Keine Ausgabe von der API erhalten."}
-
-        # JSON parsen (falls Modell trotz Bitte noch Text drumherum packt)
-        m = re.search(r"\{.*\}", out_text, flags=re.S)
-        candidate = m.group(0) if m else out_text
-        try:
-            obj = json.loads(candidate)
-            # normalize
-            return {
-                "summary": str(obj.get("summary", "")).strip(),
-                "sentiment": str(obj.get("sentiment", "")).strip(),
-                "topics": obj.get("topics", []),
-            }
-        except Exception:
-            return {"error": "Antwort war kein gültiges JSON.", "raw": out_text[:600]}
-
-    except Exception as e:
-        return {"error": f"Request fehlgeschlagen: {e}"}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    payload = {"model": model, "input": prompt}
+    r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=30)
+    return r.status_code, r.text
 
 
 # ---------------- UI ----------------
@@ -498,7 +427,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         if dropdowns_inited.get():
             return
 
-        # RT Titel Dropdown
         if rt_text.empty:
             ui.update_selectize("rt_title", choices={})
         else:
@@ -513,7 +441,6 @@ def server(input: Inputs, output: Outputs, session: Session):
             if input.rt_title() is None and choices:
                 ui.update_selectize("rt_title", selected=next(iter(choices.keys())))
 
-        # Graph Nodes Dropdown
         if edges.empty:
             ui.update_selectize("graph_node", choices={})
         else:
@@ -552,6 +479,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             ui.tags.li(f"Edges (aus RT erzeugt): {len(edges):,}".replace(",", ".")),
             ui.tags.li(f"networkx verfügbar: {'ja' if HAS_NX else 'nein (Fallback)'}"),
             ui.tags.li(f"requests verfügbar: {'ja' if HAS_REQUESTS else 'nein (OpenAI Call deaktiviert)'}"),
+            ui.tags.li(f"OPENAI_API_KEY gesetzt: {'ja' if bool(os.getenv('OPENAI_API_KEY','').strip()) else 'nein'}"),
         ]
         return ui.tags.small(ui.tags.ul(*rows, style="margin:0;padding-left:18px;"))
 
@@ -967,7 +895,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         hit = rt_text[rt_text["title_norm"] == str(key)]
         if hit.empty:
             return pd.Series({"title": "", "title_norm": str(key), "year": pd.NA, "movie_info": "", "critics_consensus": "", "genres": "", "actors": ""})
-        # falls mehrere Jahre: nimm das erste (oder man könnte hier später per Jahr auswählen)
         return hit.iloc[0]
 
     @output
@@ -1015,49 +942,158 @@ def server(input: Inputs, output: Outputs, session: Session):
         s = pd.Series(words).value_counts().head(20)
         return pd.DataFrame({"Wort": s.index, "Häufigkeit": s.values})
 
-    # KI Trigger + Result Cache
-    ai_state = reactive.Value({"note": "Noch keine Analyse gestartet."})
+    # ---- KI: Debug State (sichtbar im UI) ----
+    ai_state = reactive.Value({"status": "idle"})
 
     @reactive.Effect
     @reactive.event(input.run_ai)
     def _run_ai():
         r = rt_selected_row()
-        src = input.rt_text_source()
-        txt = str(r.get(src, "") or "")
-        res = openai_analyze_text(txt)
-        ai_state.set(res)
+        which = input.rt_text_source()
+        txt = str(r.get(which, "") or "").strip()
+
+        # sofort Debug anzeigen
+        ai_state.set({
+            "status": "running",
+            "has_key": bool(os.getenv("OPENAI_API_KEY", "").strip()),
+            "has_requests": bool(HAS_REQUESTS),
+            "text_source": which,
+            "text_len": len(txt),
+            "ts": time.strftime("%H:%M:%S"),
+        })
+
+        if not txt:
+            ai_state.set({
+                "status": "error",
+                "error": "Ausgewählte Textquelle ist leer (NaN/leer).",
+                "text_source": which,
+                "text_len": 0,
+                "ts": time.strftime("%H:%M:%S"),
+            })
+            return
+
+        if not os.getenv("OPENAI_API_KEY", "").strip():
+            ai_state.set({
+                "status": "error",
+                "error": "OPENAI_API_KEY ist nicht gesetzt (Environment Variable fehlt).",
+                "text_source": which,
+                "text_len": len(txt),
+                "ts": time.strftime("%H:%M:%S"),
+            })
+            return
+
+        if not HAS_REQUESTS:
+            ai_state.set({
+                "status": "error",
+                "error": "Python-Paket 'requests' ist nicht verfügbar.",
+                "text_source": which,
+                "text_len": len(txt),
+                "ts": time.strftime("%H:%M:%S"),
+            })
+            return
+
+        prompt = (
+            "Gib NUR JSON zurück: "
+            '{"summary":"max 2 Sätze","sentiment":"positive|neutral|negative","topics":["..","..","..","..",".."]}\n\n'
+            f"TEXT:\n{txt}"
+        )
+
+        try:
+            code, body = openai_call_json(prompt, model="gpt-4o-mini")
+            if code >= 400:
+                ai_state.set({
+                    "status": "error",
+                    "error": f"OpenAI HTTP {code}",
+                    "details": body[:900],
+                    "text_source": which,
+                    "text_len": len(txt),
+                    "ts": time.strftime("%H:%M:%S"),
+                })
+                return
+
+            data = json.loads(body)
+
+            out_text = data.get("output_text", "") or ""
+            if not out_text:
+                chunks = []
+                for item in data.get("output", []):
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            chunks.append(c.get("text", ""))
+                out_text = "\n".join(chunks).strip()
+
+            m = re.search(r"\{.*\}", out_text, flags=re.S)
+            candidate = m.group(0) if m else out_text
+            obj = json.loads(candidate)
+
+            ai_state.set({
+                "status": "ok",
+                "sentiment": str(obj.get("sentiment", "")).strip(),
+                "topics": obj.get("topics", []),
+                "summary": str(obj.get("summary", "")).strip(),
+                "text_source": which,
+                "text_len": len(txt),
+                "ts": time.strftime("%H:%M:%S"),
+            })
+        except Exception as e:
+            ai_state.set({
+                "status": "error",
+                "error": f"Exception: {e}",
+                "text_source": which,
+                "text_len": len(txt),
+                "ts": time.strftime("%H:%M:%S"),
+            })
 
     @output
     @render.ui
     def ai_result_block():
-        res = ai_state.get()
-        if not isinstance(res, dict):
+        s = ai_state.get()
+        if not isinstance(s, dict):
             return ui.tags.div("—")
 
-        if "error" in res:
-            raw = res.get("raw", "")
+        debug_line = (
+            f"Status={s.get('status','—')} · "
+            f"Quelle={s.get('text_source','—')} · "
+            f"Textlänge={s.get('text_len','—')} · "
+            f"Key={'ja' if s.get('has_key') else 'nein'} · "
+            f"requests={'ja' if s.get('has_requests') else 'nein'} · "
+            f"Zeit={s.get('ts','—')}"
+        )
+
+        if s.get("status") == "idle":
             return ui.card(
-                ui.card_header("⚠️ KI-Analyse"),
-                ui.tags.div(res["error"], style="margin-bottom:8px;"),
-                ui.tags.pre(raw, style="white-space:pre-wrap;") if raw else ui.tags.div(),
+                ui.card_header("🤖 KI-Analyse (OpenAI)"),
+                ui.tags.div(debug_line, class_="muted"),
+                ui.tags.div("Klicke auf „KI-Analyse starten“."),
             )
 
-        topics = res.get("topics", [])
-        if isinstance(topics, str):
-            topics = [topics]
+        if s.get("status") == "running":
+            return ui.card(
+                ui.card_header("🤖 KI-Analyse (OpenAI)"),
+                ui.tags.div(debug_line, class_="muted"),
+                ui.tags.div("Analyse läuft…"),
+            )
+
+        if s.get("status") == "error":
+            return ui.card(
+                ui.card_header("⚠️ KI-Analyse (Fehler)"),
+                ui.tags.div(debug_line, class_="muted", style="margin-bottom:8px;"),
+                ui.tags.div(f"❌ {s.get('error','Unbekannter Fehler')}"),
+                ui.tags.pre(str(s.get("details","")) or "", style="white-space:pre-wrap;") if s.get("details") else ui.tags.div(),
+            )
+
+        topics = s.get("topics", [])
         if isinstance(topics, list):
             topics_txt = ", ".join([str(x) for x in topics if str(x).strip()])
         else:
-            topics_txt = ""
+            topics_txt = str(topics)
 
         return ui.card(
             ui.card_header("🤖 KI-Analyse (OpenAI)"),
-            ui.tags.div(f"Sentiment: {res.get('sentiment','—')}", style="margin-bottom:6px;"),
-            ui.tags.div("Themen: " + (topics_txt or "—"), style="margin-bottom:10px;"),
-            ui.tags.pre(
-                textwrap.fill(str(res.get("summary", "") or "—"), width=110),
-                style="white-space:pre-wrap;margin:0;",
-            ),
+            ui.tags.div(debug_line, class_="muted", style="margin-bottom:8px;"),
+            ui.tags.div(f"Sentiment: {s.get('sentiment','—')}"),
+            ui.tags.div(f"Themen: {topics_txt or '—'}", style="margin-bottom:10px;"),
+            ui.tags.pre(textwrap.fill(str(s.get("summary","—")), width=110), style="white-space:pre-wrap;margin:0;"),
         )
 
     # ---------------- Graph (Subgraph + schöner Netzplan) ----------------
@@ -1089,7 +1125,6 @@ def server(input: Inputs, output: Outputs, session: Session):
         if hops == 1:
             return sub.head(800)
 
-        # 2-hop
         neigh: set[tuple[str, str]] = set()
         for _, r in sub.iterrows():
             if r["source_type"] == node_type and r["source_norm"] == node_norm:
@@ -1141,67 +1176,52 @@ def server(input: Inputs, output: Outputs, session: Session):
             ax.set_title("Graph-Fallback (erste 25 Kanten)")
             return fig
 
-        # NetworkX Graph bauen
         G = nx.Graph()
         for _, r in d.iterrows():
             s_id = f"{r['source_type']}::{r['source_norm']}"
             t_id = f"{r['target_type']}::{r['target_norm']}"
-            # label separat speichern (Originalname)
             G.add_node(s_id, label=str(r["source"]), ntype=str(r["source_type"]))
             G.add_node(t_id, label=str(r["target"]), ntype=str(r["target_type"]))
             G.add_edge(s_id, t_id, relation=str(r["relation"]))
 
-        # Fokusnode
         focus = f"{node_type}::{node_norm}"
         if focus not in G:
             focus = list(G.nodes)[0]
 
-        # wenn zu groß: auf ego-graph + degree-cut reduzieren
         if G.number_of_nodes() > max_nodes:
-            # erst ego um Fokus
             ego = nx.ego_graph(G, focus, radius=int(input.graph_hops()))
-            # dann nach degree (wichtige Knoten behalten)
             deg = dict(ego.degree())
             keep = sorted(deg.keys(), key=lambda k: deg[k], reverse=True)[:max_nodes]
             G = ego.subgraph(keep).copy()
 
-        # Layout
         try:
             pos = nx.spring_layout(G, seed=42, k=0.9, iterations=80)
         except Exception:
             pos = nx.random_layout(G, seed=42)
 
-        # Styling: Farben pro Typ + Node size nach Degree
         type_color = {"movie": "#2563EB", "actor": "#10B981", "genre": "#F59E0B"}
         degrees = dict(G.degree())
         sizes = [220 + 70 * min(degrees.get(n, 1), 10) for n in G.nodes]
         node_colors = [type_color.get(G.nodes[n].get("ntype", ""), "#94A3B8") for n in G.nodes]
 
-        # Edges
         nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.25, width=1.2)
-
-        # Nodes
         nx.draw_networkx_nodes(G, pos, ax=ax, node_size=sizes, node_color=node_colors, linewidths=0.8, edgecolors="#0f172a")
 
-        # Labels: Fokus + wichtigste Nachbarn + Top-degree
         labels = {}
         if focus in G:
             labels[focus] = G.nodes[focus].get("label", "focus")
-            # Nachbarn des Fokus
             for nb in list(G.neighbors(focus))[:18]:
                 labels[nb] = G.nodes[nb].get("label", "")
-        # Top-degree ergänzen
         top_nodes = sorted(G.nodes, key=lambda n: degrees.get(n, 0), reverse=True)[:10]
         for n in top_nodes:
             labels.setdefault(n, G.nodes[n].get("label", ""))
 
-        # Labels zeichnen
         nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=8)
 
-        # Legende manuell (klein)
         ax.text(0.01, 0.01, "movie / actor / genre", transform=ax.transAxes, fontsize=9, alpha=0.7)
-
-        ax.set_title(f"Netzplan (aus RT gebaut) — Nodes={G.number_of_nodes()}  Edges={G.number_of_edges()}  | Fokus: {labels.get(focus,'')}")
+        ax.set_title(
+            f"Netzplan (aus RT gebaut) — Nodes={G.number_of_nodes()}  Edges={G.number_of_edges()}  | Fokus: {labels.get(focus,'')}"
+        )
         ax.axis("off")
         return fig
 
